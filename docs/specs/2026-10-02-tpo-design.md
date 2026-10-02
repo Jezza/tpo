@@ -1,8 +1,8 @@
 # tpo — design
 
 Date: 2026-10-02
-Status: draft for review (rev 4 — review findings, full dual-stack incl. internet via pasta,
-supervisor stays in host namespaces)
+Status: draft for review (rev 5 — second review folded in: permanent neighbours, separate gateway
+netns, handle/MAC layout)
 
 ## 1. Purpose
 
@@ -182,17 +182,23 @@ direction of an earlier bidirectional link.
 ### 3.4 Addresses
 
 - Nodes are **dual-stack**. IPv4 addresses come from `subnet` in declaration order, skipping
-  explicit `addr`s and the addresses reserved for the gateway (`.254`). The subnet must fit all
-  nodes. Clashes are errors.
+  explicit `addr`s and the address reserved for the gateway (`.254`, or the last usable host
+  address of a larger subnet). The subnet must fit all nodes and must be `/17` or longer (indices
+  must fit tc's 16-bit minor/pref space). Clashes are errors.
 - Each node's IPv6 address is `subnet6` + the same host index (`fd77::1` for `10.77.0.1`); an
   explicit `addr6` overrides it.
-- Direct mode: each node's `eth0` MAC is deterministic, `02:74:70:<lab hash>:<index>` (locally
-  administered), so filters can key on MACs (§4.1). The gateway gets index 254.
+- Every node interface tpo creates has a deterministic, locally administered MAC
+  `02:74:<lab hash, 16 bits>:<index, 16 bits>` (routed-mode veths add the peer's index in the hash
+  bytes so each end is unique). Filters key on these MACs (§4.1) and neighbour entries are
+  static (§4).
 - **Allocations are persisted** in `state.json`: on `apply`, existing nodes keep their addresses;
   new nodes get the lowest free one; removed nodes free theirs. An explicit `addr` that differs
   from the current one changes it.
-- A node's **index** (for tc handles/prefs) is the host part of its address, so handles are
-  stable across `apply` for free.
+- A node's **index** is the host part of its IPv4 address (1 … 65533), so handles are stable
+  across `apply` for free. tc layout per node: HTB root `1:`, default class `1:fffe`, per-peer
+  class `1:<idx>`, its netem addressed as `parent 1:<idx>` (kernel-assigned handle), peer filters
+  `pref <idx>`, the final drop rule `pref 65535`. HTB `quantum` is set explicitly so the large
+  classifier rates don't trigger kernel warnings.
 - Routed mode has no per-link addressing (unnumbered veths, §4.2). `metric = "hops" | "delay"`
   (default `hops`); with `delay`, `set`/`heal` that change delay also recompute routes.
 
@@ -217,6 +223,14 @@ direction of an earlier bidirectional link.
 Common to both modes, in every node: `lo` up; IPv6 enabled; `rp_filter=0` set explicitly;
 IPv6 DAD disabled (`accept_dad=0`, addresses are unique by construction) so addresses are usable
 immediately.
+
+**Static neighbours.** Because every MAC is known, tpo installs **permanent neighbour entries**
+(`ip neigh replace <addr> lladdr <mac> nud permanent`, for IPv4, IPv6 global and IPv6 link-local)
+instead of relying on ARP/NDP: in direct mode for every lab node and the gateway on every node;
+in routed mode for each veth's peer. This is required for one-way edges: with dynamic resolution
+an a→b-only edge delivers nothing (b's ARP/NDP replies are dropped at a), and a `--oneway` cut
+decays into a bidirectional one once neighbour entries go stale (verified). It also means no
+ARP/NDP traffic, so `explain`/golden output is deterministic.
 
 ### 4.1 `direct` — reachability = adjacency
 
@@ -249,7 +263,11 @@ immediately.
 
   One rule per neighbour covers IPv4, IPv6, ARP, NDP and anything else. Filtering at the
   receiver also confines broadcast/multicast discovery (including IPv6 link-local and mDNS) to
-  neighbours, and makes non-neighbours invisible at L2 (`arping`/`ndisc6` fail).
+  neighbours, and makes non-neighbours invisible at L2 (`arping`/`ndisc6` fail). Verified with
+  IPv4, IPv6 global and link-local: neighbours get the configured delay, non-neighbours get
+  nothing, `ping ff02::1` answers only from neighbours.
+- Because ingress is default-drop, adding a node with `apply` is order-safe: its frames are dropped
+  everywhere until its allow rules are installed.
 - No IP forwarding: a node reaches only nodes it has an edge to. Multi-hop delivery is the
   application's job.
 - Setup and multi-op changes are applied with `tc -batch` per node (N² filters otherwise means N²
@@ -267,9 +285,9 @@ immediately.
 - Routes: to each neighbour `ip route add <nbr>/32 dev <veth>`; to each further node
   `ip route add <dst>/32 via <next-hop> dev <veth> onlink`, along the shortest path over live
   directed edges (`metric`). The source address is the node's `/32` (verified).
-- IPv6 likewise: each node's `/128` on `lo`; veths carry only their link-local address, which is
-  deterministic because tpo sets each veth's MAC; routes are
-  `ip -6 route add <dst>/128 via fe80::<next-hop LL> dev <veth>`.
+- IPv6 likewise: each node's `/128` on `lo`; each veth gets an explicit link-local
+  `fe80::<own index>/64`; routes are `ip -6 route add <dst>/128 via fe80::<next-hop index> dev
+  <veth>`.
 - **`internet` is never a transit hop** in path computation (the gateway drops lab→lab traffic).
 - netem on each veth's egress, per direction (same class-per-edge rules as §4.1, one peer per
   veth so no classifier needed).
@@ -289,8 +307,10 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - `/etc/hosts`: every node's name → IPv4 and IPv6 address, plus `internet` → gateway, plus
   `host` → the host-loopback addresses when `host_loopback = true`. Updated **in place**
   (truncate + write, never rename) so the bind mount keeps pointing at it.
-- `/etc/resolv.conf`: the pasta DNS-forward addresses (`192.0.2.53`, `2001:db8::53`) when the
-  lab uses `internet`, otherwise empty.
+- `/etc/resolv.conf`: the DNS-forward addresses for the address families the host actually has
+  (as found by `doctor`; IPv4 `192.0.2.53` first, then IPv6 `2001:db8::53`) when the lab uses
+  `internet`, otherwise empty. Listing a family the host lacks would make every lookup wait out
+  glibc's timeout.
 - `/etc/nsswitch.conf`: `hosts: files dns`, so lookups never reach host daemons (avahi/mDNS,
   systemd-resolved, `myhostname`) over unix sockets. Other databases are copied from the host's.
 - hostname (`sethostname`) = node name.
@@ -300,14 +320,25 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - `internet` is a reserved built-in node, created only if some link references it. It behaves
   like any node for links, faults and properties (`tpo cut a internet` = WAN outage, including
   for already-open connections). It is **dual-stack**: IPv4 and IPv6 work equally.
-- Implementation: a hidden gateway namespace with a **pasta** uplink, `nft` `inet` masquerade
-  (IPv4 NAT and NAT66) on the uplink interface, and IPv4 + IPv6 forwarding enabled.
+- Implementation: a **separate gateway namespace** (not the hub), created like a node, with a
+  **pasta** uplink, `nft` `inet` masquerade (IPv4 NAT and NAT66) on the uplink interface, and
+  IPv4 + IPv6 forwarding enabled.
+  - In direct mode its veth `gw0` sits on the bridge and is treated **exactly like a node**:
+    index/MAC of the gateway address, per-peer egress classes (the "gateway → node" direction of
+    each `internet` edge), and a src-MAC ingress allowlist of nodes with a live edge to
+    `internet`. The nft sets below are then defence in depth.
+  - In routed mode it is the `internet` router node, with veths to linked nodes.
+  - Its nft `input` chain drops everything from the lab except established traffic, so a node
+    without an `internet` edge can't even ping the gateway.
+  - Like nodes, its netns is held by a long-lived holder process inside the lab pid namespace
+    (§7.1), so the netns has a `/proc` path that disappears with the lab.
 - **pasta** (from `passt`, rootless Podman's default) copies the host's real addresses and routes
   into the gateway's `tap0` and translates its traffic to host sockets. Lab traffic is
   masqueraded to those addresses, so it leaves the host as ordinary host traffic over whatever
   IPv4/IPv6 connectivity the host has.
 - **Launching pasta**: the supervisor (in the host netns, §2) spawns
-  `pasta --config-net -I tap0 --userns <lab userns> --netns <gateway netns>
+  `pasta --config-net -I tap0 --userns /proc/<init pid>/ns/user
+  --netns /proc/<gateway holder pid>/ns/net
   --dns-forward 192.0.2.53 --dns-forward 2001:db8::53 --map-host-loopback <none|192.0.2.2>
   -P <pidfile>` and waits for it to exit 0 (it daemonises once `tap0` is configured) before
   configuring `nft`. Exact flags (e.g. the IPv6 host-loopback mapping) are pinned during
@@ -316,8 +347,10 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
   resolver (works even when the host resolver is on `127.0.0.1`). These addresses are from the
   documentation ranges and route via the gateway's default route, so they never collide with lab
   addresses.
-- **Lifecycle**: the supervisor tracks pasta by pidfile/pidfd and kills it on `down`; pasta also
-  exits when the gateway netns disappears. If it dies, `internet` is marked `degraded` in
+- **Lifecycle**: the supervisor tracks pasta by pidfile/pidfd and kills it on `down`. If the
+  supervisor is `kill -9`ed that kill never runs, so pasta is given `/proc/<pid>/ns/...` paths of
+  lab processes (not supervisor fd paths): when the lab pid namespace dies, those paths vanish and
+  pasta, which watches its netns path, exits. If pasta dies, `internet` is marked `degraded` in
   `tpo show` and its edges stop working.
 - **Enforcement** is at the gateway (internet traffic carries non-lab addresses):
   - nft named sets `allowed4`/`allowed6` hold the addresses of nodes with a live edge to
@@ -336,7 +369,8 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - `[internet] host_loopback = true` maps `192.0.2.2` / `2001:db8::2` (resolvable as `host`) to the
   host's loopback, so a service on the laptop (e.g. a local lighthouse) is reachable.
 - If the host has no IPv6 (or no IPv4) connectivity, that family is unavailable in the lab too;
-  `doctor` reports which families the host has.
+  `doctor` reports which families the host has, and warns when a host route that pasta copies
+  into the gateway overlaps `subnet`/`subnet6`.
 - Rootless ICMP to the internet requires the host's `net.ipv4.ping_group_range` to allow it;
   TCP/UDP always work.
 - pasta and `/dev/net/tun` are runtime dependencies only for rootless labs using `internet`.
@@ -366,10 +400,11 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   1. `clone(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)` the **lab init** (`tpo __init`), which
      is pid 1 of the lab pid namespace; write its uid/gid maps.
   2. The init sets `PR_SET_PDEATHSIG(SIGKILL)` (its parent thread is the supervisor's permanent
-     main thread), then just reaps zombies. When it dies, the kernel SIGKILLs every process in the
-     lab pid namespace.
-  3. The supervisor opens fds on the init's `ns/{user,net,pid}`; the init's netns is the hub
-     (bridge) and gateway namespace.
+     main thread), then checks `getppid()` to close the clone→prctl race (exits if the supervisor
+     is already gone), then just reaps zombies. When it dies, the kernel SIGKILLs every process in
+     the lab pid namespace.
+  3. The supervisor opens fds on the init's `ns/{user,net,pid}`; the init's netns is the **hub**
+     (the bridge only). The gateway has its own netns (§6).
 - **All forks** (node setup, node processes, `ip`/`tc`/`nft` invocations, pasta) happen on one
   dedicated, never-exiting spawner thread, so PDEATHSIG and thread-lifetime surprises cannot
   occur.
@@ -378,7 +413,10 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   - pasta: spawned without any `setns`; it joins the gateway netns itself (§6).
   - Node setup: a child joins the lab user + pid namespaces via `tpo __enter`, unshares
     net + mnt + uts, sets up mounts/hostname/sysctls, and stays as a tiny holder until the
-    supervisor has opened fds on its `ns/{net,mnt,uts}`, then exits.
+    supervisor has opened fds on its `ns/{net,mnt,uts}`, then exits. The gateway's holder is the
+    exception: it stays alive for the lab's lifetime (pasta needs a `/proc` path, §6). Verified:
+    a holder joining user+pid from the host, then unsharing net+mnt+uts, remounting `/proc` and
+    setting the hostname works, and `kill -9` of init kills it.
   - Node processes (from `run`): `tpo __enter <node> -- sh -c <cmd>` (§7.2), in their own
     process group; `stop` signals the group.
 - Lab directory `$XDG_RUNTIME_DIR/tpo/<lab>/` (root mode: `/run/tpo/<lab>/`): `pid`, `ctl.sock`,
@@ -388,7 +426,8 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
 - Supervisor crash or `kill -9`: the lab init gets PDEATHSIG, so the same cleanup happens via the
   kernel; pasta exits when its netns disappears. Nothing is left behind rootless.
 - Root mode: same structure without the user namespace; nodes' netns are additionally bind-mounted
-  under `/run/netns/tpo-<lab>-<node>`.
+  under `/run/netns/tpo-<lab>-<node>` by the supervisor itself (it is still in the host mount
+  namespace, so the bind mounts are visible to the host).
 
 ### 7.2 Protocol and the CLI
 
@@ -402,7 +441,8 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   1. `setns` user → mnt → net → uts → pid, before anything could spawn a thread
   2. `chdir` back to the original cwd (`setns(mnt)` resets it to `/`; falls back to `/`)
   3. fork (the pid namespace applies to children) and exec the command in the child with the
-     `TPO_*` environment; the parent waits and exits with the child's status.
+     `TPO_*` environment; the parent forwards SIGTERM/SIGINT/SIGHUP to the child, waits,
+     and exits with the child's status (128 + n if it died from signal n).
 
   tty, stdio and signals are inherited normally.
 
@@ -528,12 +568,15 @@ Licence: MIT OR Apache-2.0.
    - direct-mode non-neighbours exchange nothing: IPv4, IPv6 (incl. link-local multicast),
      ARP (`arping`), NDP, and raw frames; IPv6 between neighbours gets the link's delay;
    - routed multi-hop works over IPv4 and IPv6, failover after a cut, `--oneway` cut;
+   - one-way edges carry unicast (UDP over IPv4 and IPv6) in both modes, and a `--oneway` cut
+     stays one-way after neighbour timeouts would have expired;
    - `--for` heals on time;
    - `internet`: reachable over IPv4 and IPv6 (TCP/UDP, by name and by IP) while nodes stay
      mutually isolated; `cut a internet` kills an open connection on both families;
      `host_loopback` reaches a listener on the host;
    - names resolve from `/etc/hosts`, and lookups never leave the node (no host avahi/resolved);
-   - `kill -9` of the supervisor and `tpo down` leave no processes, namespaces or interfaces,
+   - `kill -9` of the supervisor and `tpo down` leave no processes (including pasta), namespaces
+     or interfaces,
      including with an open `tpo shell`.
 
    Skips with a stated reason when `doctor` fails.
