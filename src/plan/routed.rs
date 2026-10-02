@@ -38,6 +38,8 @@ pub struct RoutedNet {
     pub routes: BTreeMap<u32, Route>,
     /// Towards `internet`: the neighbour, if this is a node with a path to it.
     pub default_via: Option<(u32, Iface)>,
+    /// Whether a live path to `internet` exists right now (`default_via` may be a kept route).
+    pub internet_path: bool,
 }
 
 pub type Desired = IndexMap<Target, RoutedNet>;
@@ -156,6 +158,7 @@ pub fn desired(ctx: &Ctx, eff: &IndexMap<Edge, EffEdge>, prev: Option<&Desired>)
             }
         };
 
+        let internet_path = me != INTERNET && hops.contains_key(INTERNET);
         out.insert(
             target,
             RoutedNet {
@@ -163,6 +166,7 @@ pub fn desired(ctx: &Ctx, eff: &IndexMap<Edge, EffEdge>, prev: Option<&Desired>)
                 ports,
                 routes,
                 default_via,
+                internet_path,
             },
         );
     }

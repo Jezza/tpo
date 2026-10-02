@@ -125,12 +125,19 @@ impl Lab {
     pub fn reconcile(&mut self) -> Result<Vec<String>, String> {
         let eff = effective(&self.topo, &self.faults, now_ms());
         let desired = Net::plan(&Ctx::new(&self.topo, &self.addrs), &eff, &self.desired);
-        let ops = self.desired.diff(&desired);
+        let mut ops = self.desired.diff(&desired);
+        let allowed = desired.internet_allowed();
+        if self.pasta_pid.is_some() {
+            ops.extend(super::uplink::update_ops(&self.allowed, &allowed));
+        }
         match backend::run(&self.netfds(), &self.tools, &ops) {
             Ok(()) => {
                 let changes = describe_changes(&self.eff, &eff);
                 self.eff = eff;
                 self.desired = desired;
+                if self.pasta_pid.is_some() {
+                    self.allowed = allowed;
+                }
                 Ok(changes)
             }
             Err(e) => {
@@ -351,6 +358,9 @@ fn apply(shared: &Shared, path: &str, source: &str) -> Outcome {
             lab.nodes.shift_remove(&Target::node(node));
         }
         let had_internet = lab.topo.uses_internet();
+        if had_internet && !next.uses_internet() {
+            lab.stop_uplink();
+        }
         if had_internet
             && !next.uses_internet()
             && let Some(mut gw) = lab.nodes.shift_remove(&Target::Gateway)
@@ -378,6 +388,9 @@ fn apply(shared: &Shared, path: &str, source: &str) -> Outcome {
         changes.extend(added.iter().map(|n| format!("add node {n}")));
         lab.eff = old_eff;
         changes.extend(lab.reconcile()?);
+        if !had_internet && lab.topo.uses_internet() {
+            lab.start_uplink()?;
+        }
         lab.file = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
         lab.save();
         (changes, added)

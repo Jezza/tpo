@@ -17,6 +17,9 @@ pub fn hosts(topo: &Topology, addrs: &Addresses) -> String {
     if topo.uses_internet() {
         let _ = writeln!(out, "{}\t{INTERNET}", addrs.gateway.v4);
         let _ = writeln!(out, "{}\t{INTERNET}", addrs.gateway.v6);
+        if topo.internet.host_loopback {
+            let _ = writeln!(out, "{}\thost", super::uplink::HOST4);
+        }
     }
     out
 }
@@ -46,7 +49,12 @@ fn write_in_place(path: &Path, contents: &str) -> io::Result<()> {
 pub fn write_etc(dir: &LabDir, topo: &Topology, addrs: &Addresses) -> io::Result<()> {
     let etc = dir.etc();
     write_in_place(&etc.join("hosts"), &hosts(topo, addrs))?;
-    write_in_place(&etc.join("resolv.conf"), "")?;
+    let resolv = if topo.uses_internet() {
+        super::uplink::resolv_conf()
+    } else {
+        String::new()
+    };
+    write_in_place(&etc.join("resolv.conf"), &resolv)?;
     let host = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
     write_in_place(&etc.join("nsswitch.conf"), &nsswitch(&host))
 }

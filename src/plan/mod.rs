@@ -70,6 +70,29 @@ impl Net {
         }
     }
 
+    /// Nodes allowed through the internet gateway right now, as `(ipv4, ipv6)`.
+    pub fn internet_allowed(
+        &self,
+    ) -> std::collections::BTreeSet<(std::net::Ipv4Addr, std::net::Ipv6Addr)> {
+        match self {
+            Net::Direct(d) => d
+                .get(&Target::Gateway)
+                .map(|gw| {
+                    gw.allow
+                        .keys()
+                        .filter_map(|i| gw.neighbours.get(i))
+                        .map(|n| (n.v4, n.v6))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Net::Routed(d) => d
+                .values()
+                .filter(|n| n.internet_path)
+                .map(|n| (n.own.v4, n.own.v6))
+                .collect(),
+        }
+    }
+
     /// Everything that produces `t`'s state from empty namespaces.
     pub fn explain(&self, t: &Target) -> Option<Vec<Op>> {
         match self {

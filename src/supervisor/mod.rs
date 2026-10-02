@@ -5,6 +5,7 @@ mod files;
 mod handlers;
 mod procs;
 mod server;
+mod uplink;
 
 use crate::addr::{Addresses, allocate};
 use crate::backend::{self, NetFds, Tools};
@@ -40,6 +41,8 @@ pub struct NodeNs {
     pub uts: OwnedFd,
     /// Kept open for the gateway, whose holder must outlive setup (spec §6).
     pub holder: Option<Child>,
+    /// The holder's host pid, while it is alive.
+    pub holder_pid: Option<i32>,
 }
 
 /// Everything the supervisor knows, behind one lock.
@@ -59,6 +62,10 @@ pub struct Lab {
     /// Woken when faults with deadlines change, or on shutdown.
     pub wake: Arc<Condvar>,
     pub shutting_down: bool,
+    /// pasta, while the lab uses `internet`.
+    pub pasta_pid: Option<i32>,
+    /// Nodes currently in the gateway's nft sets.
+    pub allowed: uplink::Allowed,
 }
 
 pub type Shared = Arc<Mutex<Lab>>;
@@ -166,6 +173,8 @@ fn start(opts: &Options) -> Result<Shared, String> {
         procs: IndexMap::new(),
         wake: Arc::new(Condvar::new()),
         shutting_down: false,
+        pasta_pid: None,
+        allowed: uplink::Allowed::new(),
     };
     let shared = Arc::new(Mutex::new(lab));
     {
@@ -229,6 +238,9 @@ fn build(lab: &mut Lab) -> Result<(), String> {
     let ops = desired.initial_ops();
     backend::run(&lab.netfds(), &lab.tools, &ops)?;
     lab.desired = desired;
+    if lab.topo.uses_internet() {
+        lab.start_uplink()?;
+    }
     Ok(())
 }
 
@@ -266,10 +278,12 @@ pub(super) fn spawn_holder(lab: &Lab, hostname: &str, keep: bool) -> Result<Node
         mnt: open("mnt")?,
         uts: open("uts")?,
         holder: None,
+        holder_pid: None,
     };
     if keep {
         Ok(NodeNs {
             holder: Some(child),
+            holder_pid: Some(host_pid),
             ..node
         })
     } else {
@@ -287,6 +301,7 @@ struct SavedState<'a> {
     topology: &'a Topology,
     addresses: &'a Addresses,
     faults: &'a Faults,
+    pasta_pid: Option<i32>,
 }
 
 impl Lab {
@@ -380,6 +395,7 @@ impl Lab {
             topology: &self.topo,
             addresses: &self.addrs,
             faults: &self.faults,
+            pasta_pid: self.pasta_pid,
         };
         let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
         let tmp = self.dir.state().with_extension("json.tmp");
@@ -390,6 +406,7 @@ impl Lab {
     /// Kills every lab process (the pid namespace dies with its init) and removes the lab dir.
     pub fn teardown(&mut self) {
         self.shutting_down = true;
+        self.stop_uplink();
         let _ = nix::sys::signal::kill(self.init.pid, nix::sys::signal::Signal::SIGKILL);
         for ns in self.nodes.values_mut() {
             if let Some(mut h) = ns.holder.take() {
@@ -398,6 +415,31 @@ impl Lab {
             }
         }
         let _ = self.dir.remove();
+    }
+
+    /// Installs the gateway's nft ruleset and starts pasta (spec §6).
+    pub fn start_uplink(&mut self) -> Result<(), String> {
+        let holder = self
+            .nodes
+            .get(&Target::Gateway)
+            .and_then(|g| g.holder_pid)
+            .ok_or("the gateway namespace is missing")?;
+        let allowed = self.desired.internet_allowed();
+        let ruleset = crate::plan::Op::nft(&Target::Gateway, uplink::ruleset(&allowed));
+        backend::run(&self.netfds(), &self.tools, &[ruleset])?;
+        self.allowed = allowed;
+        self.pasta_pid = Some(uplink::start_pasta(self, holder)?);
+        Ok(())
+    }
+
+    pub fn stop_uplink(&mut self) {
+        if let Some(pid) = self.pasta_pid.take() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        self.allowed.clear();
     }
 
     pub fn endpoint_env(&self, node: &str) -> Vec<(String, String)> {
