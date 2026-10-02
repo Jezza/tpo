@@ -3,4 +3,5 @@
 pub mod addr;
 pub mod model;
 pub mod net;
+pub mod plan;
 pub mod units;
