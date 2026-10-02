@@ -4,7 +4,8 @@ use super::procs;
 use super::{Lab, Shared, now_ms};
 use crate::backend;
 use crate::model::{INTERNET, Topology};
-use crate::plan::direct::{self, Ctx};
+use crate::plan::Net;
+use crate::plan::direct::Ctx;
 use crate::plan::{
     Faults, Target, Until, describe_changes, describe_props, edges_between, effective,
     parse_assignments,
@@ -123,8 +124,8 @@ impl Lab {
     /// the affected nodes are rebuilt to the previous state (spec §8).
     pub fn reconcile(&mut self) -> Result<Vec<String>, String> {
         let eff = effective(&self.topo, &self.faults, now_ms());
-        let desired = direct::desired(&Ctx::new(&self.topo, &self.addrs), &eff);
-        let ops = direct::diff(&self.desired, &desired);
+        let desired = Net::plan(&Ctx::new(&self.topo, &self.addrs), &eff, &self.desired);
+        let ops = self.desired.diff(&desired);
         match backend::run(&self.netfds(), &self.tools, &ops) {
             Ok(()) => {
                 let changes = describe_changes(&self.eff, &eff);
@@ -146,11 +147,7 @@ impl Lab {
     pub fn rebuild(&mut self, targets: &[Target]) -> Result<(), String> {
         let mut ops = Vec::new();
         for t in targets.iter().filter(|t| **t != Target::Hub) {
-            let Some(net) = self.desired.get(t) else {
-                continue;
-            };
-            ops.extend(direct::reset_ops(t));
-            ops.extend(direct::diff_from_reset(t, net));
+            ops.extend(self.desired.rebuild(t).unwrap_or_default());
         }
         backend::run(&self.netfds(), &self.tools, &ops)
     }
@@ -159,7 +156,7 @@ impl Lab {
 fn resync(shared: &Shared, selector: Option<&str>) -> Outcome {
     let mut lab = shared.lock().unwrap();
     let targets: Vec<Target> = match selector {
-        None => lab.desired.keys().cloned().collect(),
+        None => lab.desired.targets(),
         Some(sel) => lab
             .topo
             .select(sel)
@@ -276,14 +273,11 @@ fn explain(lab: &Lab, node: &str) -> Result<Value, String> {
     } else {
         Target::node(node)
     };
-    let net = lab
+    let ops = lab
         .desired
-        .get(&target)
+        .explain(&target)
         .ok_or_else(|| format!("unknown node `{node}`"))?;
-    let lines: Vec<String> = direct::explain_ops(&target, net)
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+    let lines: Vec<String> = ops.iter().map(ToString::to_string).collect();
     Ok(json!({ "ops": lines }))
 }
 

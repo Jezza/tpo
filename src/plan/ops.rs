@@ -19,6 +19,20 @@ impl Target {
     }
 }
 
+impl Target {
+    /// The inverse of `Display`.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "hub" => Target::Hub,
+            "gateway" => Target::Gateway,
+            n => Target::node(n),
+        }
+    }
+}
+
+/// The prefix of an `ip` argument the backend replaces with a path to that target's netns.
+pub const NETNS_OF: &str = "@netns:";
+
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

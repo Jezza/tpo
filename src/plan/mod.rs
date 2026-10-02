@@ -2,6 +2,7 @@
 
 pub mod direct;
 pub mod ops;
+pub mod routed;
 
 pub use ops::{Op, Target};
 
@@ -12,6 +13,82 @@ use serde::{Deserialize, Serialize};
 
 fn err(msg: impl Into<String>) -> ModelError {
     ModelError(msg.into())
+}
+
+// ---- desired network state, by mode -------------------------------------------------------
+
+/// The desired network state of every endpoint, in the lab's mode.
+#[derive(Clone, Debug)]
+pub enum Net {
+    Direct(direct::Desired),
+    Routed(routed::Desired),
+}
+
+impl Net {
+    pub fn empty(mode: crate::model::Mode) -> Self {
+        match mode {
+            crate::model::Mode::Direct => Net::Direct(direct::Desired::new()),
+            crate::model::Mode::Routed => Net::Routed(routed::Desired::new()),
+        }
+    }
+
+    /// The desired state for `eff`; `prev` supplies routes to keep when no path exists.
+    pub fn plan(ctx: &direct::Ctx, eff: &IndexMap<Edge, EffEdge>, prev: &Net) -> Self {
+        match ctx.topo.mode {
+            crate::model::Mode::Direct => Net::Direct(direct::desired(ctx, eff)),
+            crate::model::Mode::Routed => {
+                let prev = match prev {
+                    Net::Routed(p) => Some(p),
+                    Net::Direct(_) => None,
+                };
+                Net::Routed(routed::desired(ctx, eff, prev))
+            }
+        }
+    }
+
+    /// Operations from `self` to `new`.
+    pub fn diff(&self, new: &Net) -> Vec<Op> {
+        match (self, new) {
+            (Net::Direct(a), Net::Direct(b)) => direct::diff(a, b),
+            (Net::Routed(a), Net::Routed(b)) => routed::diff(a, b),
+            (_, Net::Direct(b)) => direct::initial_ops(b),
+            (_, Net::Routed(b)) => routed::initial_ops(b),
+        }
+    }
+
+    pub fn initial_ops(&self) -> Vec<Op> {
+        match self {
+            Net::Direct(d) => direct::initial_ops(d),
+            Net::Routed(d) => routed::initial_ops(d),
+        }
+    }
+
+    pub fn targets(&self) -> Vec<Target> {
+        match self {
+            Net::Direct(d) => d.keys().cloned().collect(),
+            Net::Routed(d) => d.keys().cloned().collect(),
+        }
+    }
+
+    /// Everything that produces `t`'s state from empty namespaces.
+    pub fn explain(&self, t: &Target) -> Option<Vec<Op>> {
+        match self {
+            Net::Direct(d) => d.get(t).map(|n| direct::explain_ops(t, n)),
+            Net::Routed(d) => d.get(t).map(|n| routed::explain_ops(t, n)),
+        }
+    }
+
+    /// Rebuilds `t`'s tc/neighbour/route state from scratch.
+    pub fn rebuild(&self, t: &Target) -> Option<Vec<Op>> {
+        match self {
+            Net::Direct(d) => d.get(t).map(|n| {
+                let mut ops = direct::reset_ops(t);
+                ops.extend(direct::diff_from_reset(t, n));
+                ops
+            }),
+            Net::Routed(d) => d.get(t).map(|n| routed::rebuild_ops(t, n)),
+        }
+    }
 }
 
 // ---- sides -------------------------------------------------------------------------------

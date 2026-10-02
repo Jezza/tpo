@@ -25,7 +25,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn alloc(&self, endpoint: &str) -> Allocation {
+    pub(super) fn alloc(&self, endpoint: &str) -> Allocation {
         if endpoint == INTERNET {
             self.addrs.gateway
         } else {
@@ -33,7 +33,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn iface(&self, endpoint: &str) -> Iface {
+    pub(super) fn iface(&self, endpoint: &str) -> Iface {
         let a = self.alloc(endpoint);
         Iface {
             index: a.index,
@@ -45,7 +45,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn target(endpoint: &str) -> Target {
+    pub(super) fn target(endpoint: &str) -> Target {
         if endpoint == INTERNET {
             Target::Gateway
         } else {
@@ -53,7 +53,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn endpoints(&self) -> Vec<&str> {
+    pub(super) fn endpoints(&self) -> Vec<&str> {
         let mut out: Vec<&str> = self.topo.nodes.keys().map(String::as_str).collect();
         if self.topo.uses_internet() {
             out.push(INTERNET);
@@ -74,7 +74,7 @@ pub struct Iface {
 }
 
 impl Iface {
-    fn link_local(&self) -> String {
+    pub(super) fn link_local(&self) -> String {
         format!("fe80::{:x}", self.index)
     }
 }

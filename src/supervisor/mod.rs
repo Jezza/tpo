@@ -12,7 +12,8 @@ use crate::enter::{EnterSpec, NodeSetup};
 use crate::labdir::LabDir;
 use crate::model::{INTERNET, Topology};
 use crate::ns::{self, LabInit};
-use crate::plan::direct::{self, Ctx, Desired};
+use crate::plan::Net;
+use crate::plan::direct::Ctx;
 use crate::plan::{EffEdge, Faults, Target, effective};
 use indexmap::IndexMap;
 use procs::Proc;
@@ -50,7 +51,7 @@ pub struct Lab {
     pub addrs: Addresses,
     pub faults: Faults,
     pub eff: IndexMap<crate::model::Edge, EffEdge>,
-    pub desired: Desired,
+    pub desired: Net,
     pub init: LabInit,
     pub nodes: IndexMap<Target, NodeNs>,
     pub tools: Tools,
@@ -149,6 +150,7 @@ fn start(opts: &Options) -> Result<Shared, String> {
     files::write_etc(&dir, &topo, &addrs)
         .map_err(|e| format!("can't write the lab's /etc files: {e}"))?;
 
+    let topo_mode = topo.mode;
     let lab = Lab {
         dir,
         file,
@@ -157,7 +159,7 @@ fn start(opts: &Options) -> Result<Shared, String> {
         addrs,
         faults: Faults::default(),
         eff: IndexMap::new(),
-        desired: Desired::new(),
+        desired: Net::empty(topo_mode),
         init,
         nodes: IndexMap::new(),
         tools,
@@ -223,8 +225,8 @@ fn build(lab: &mut Lab) -> Result<(), String> {
     }
     lab.eff = effective(&lab.topo, &lab.faults, now_ms());
     let ctx = Ctx::new(&lab.topo, &lab.addrs);
-    let desired = direct::desired(&ctx, &lab.eff);
-    let ops = direct::initial_ops(&desired);
+    let desired = Net::plan(&ctx, &lab.eff, &Net::empty(lab.topo.mode));
+    let ops = desired.initial_ops();
     backend::run(&lab.netfds(), &lab.tools, &ops)?;
     lab.desired = desired;
     Ok(())

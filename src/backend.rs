@@ -3,7 +3,7 @@
 use crate::labdir::tool;
 use crate::ns;
 use crate::plan::ops::Action;
-use crate::plan::ops::HUB_PID;
+use crate::plan::ops::{HUB_PID, NETNS_OF};
 use crate::plan::{Op, Target};
 use nix::sched::CloneFlags;
 use std::collections::HashMap;
@@ -87,26 +87,38 @@ fn run_batch(fds: &NetFds, tools: &Tools, batch: &[Op]) -> Result<(), String> {
         .as_raw_fd();
     let user = fds.user.as_ref().map(AsRawFd::as_raw_fd);
     let hub_pid = fds.hub_pid.to_string();
+    // `@netns:<target>` becomes an inherited fd for that target's netns.
+    let mut inherited: Vec<RawFd> = Vec::new();
+    let mut netns_path = |arg: &str| -> Result<String, String> {
+        let t = Target::parse(&arg[NETNS_OF.len()..]);
+        let fd = fds
+            .nets
+            .get(&t)
+            .ok_or_else(|| format!("no namespace for `{t}`"))?
+            .as_raw_fd();
+        inherited.push(fd);
+        Ok(format!("/proc/self/fd/{fd}"))
+    };
 
     let (program, args, input): (&PathBuf, Vec<String>, String) = match kind(&batch[0]) {
         Kind::Ip | Kind::Tc => {
-            let lines: Vec<String> = batch
-                .iter()
-                .map(|op| match &op.action {
-                    Action::Ip(a) | Action::Tc(a) => a
-                        .iter()
-                        .map(|w| {
-                            if w == HUB_PID {
-                                hub_pid.as_str()
-                            } else {
-                                w.as_str()
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    _ => unreachable!(),
-                })
-                .collect();
+            let mut lines: Vec<String> = Vec::new();
+            for op in batch {
+                let (Action::Ip(a) | Action::Tc(a)) = &op.action else {
+                    unreachable!()
+                };
+                let mut words = Vec::new();
+                for w in a {
+                    words.push(if w == HUB_PID {
+                        hub_pid.clone()
+                    } else if w.starts_with(NETNS_OF) {
+                        netns_path(w)?
+                    } else {
+                        w.clone()
+                    });
+                }
+                lines.push(words.join(" "));
+            }
             let program = if kind(&batch[0]) == Kind::Ip {
                 &tools.ip
             } else {
@@ -146,6 +158,7 @@ fn run_batch(fds: &NetFds, tools: &Tools, batch: &[Op]) -> Result<(), String> {
         }
     };
 
+    let inherited = inherited.clone();
     let mut cmd = Command::new(program);
     cmd.args(&args)
         .stdin(Stdio::piped())
@@ -159,7 +172,8 @@ fn run_batch(fds: &NetFds, tools: &Tools, batch: &[Op]) -> Result<(), String> {
                 joins.push((u, CloneFlags::CLONE_NEWUSER));
             }
             joins.push((net, CloneFlags::CLONE_NEWNET));
-            ns::join(&joins)
+            ns::join(&joins)?;
+            inherited.iter().try_for_each(|fd| ns::inherit(*fd))
         });
     }
     let mut child = cmd
