@@ -7,6 +7,8 @@ mod procs;
 mod server;
 mod uplink;
 
+pub use uplink::host_families;
+
 use crate::addr::{Addresses, allocate};
 use crate::backend::{self, NetFds, Tools};
 use crate::enter::{EnterSpec, NodeSetup};
@@ -21,11 +23,10 @@ use procs::Proc;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
 pub struct Options {
@@ -105,6 +106,10 @@ pub fn run(opts: Options) -> ! {
             server::serve(lab)
         }
         Err(e) => {
+            let e = match crate::doctor::hint_for(&e) {
+                Some(hint) => format!("{e}\n  fix: {hint}"),
+                None => e,
+            };
             match ready.as_mut() {
                 Some(r) => {
                     let _ = writeln!(r, "error: {e}");
@@ -321,64 +326,16 @@ impl Lab {
         }
     }
 
-    /// Spawns `tpo __enter` with `spec`'s fds inherited; returns the wrapper and the host pid of
-    /// the process inside, once it reported `ready`.
+    /// Spawns `tpo __enter` (see [`crate::enter::spawn`]).
     pub fn spawn_enter(
         &self,
-        mut spec: EnterSpec,
+        spec: EnterSpec,
         stdin: Stdio,
         stdout: Stdio,
         stderr: Stdio,
     ) -> Result<(Child, i32), String> {
-        let (read, write) = nix::unistd::pipe().map_err(|e| e.to_string())?;
-        spec.report = Some(write.as_raw_fd());
-        let inherit: Vec<RawFd> = [
-            spec.user,
-            spec.mnt,
-            spec.net,
-            spec.uts,
-            spec.pid,
-            spec.report,
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg("__enter")
-            .arg(json)
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(stderr);
-        // SAFETY: only fcntl between fork and exec.
-        unsafe {
-            cmd.pre_exec(move || inherit.iter().try_for_each(|fd| ns::inherit(*fd)));
-        }
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("can't start `tpo __enter`: {e}"))?;
-        drop(write);
-
-        let mut pid = None;
-        let mut ready = false;
-        for line in BufReader::new(File::from(read)).lines() {
-            let Ok(line) = line else { break };
-            if let Some(p) = line.strip_prefix("pid ") {
-                pid = p.trim().parse().ok();
-            } else if line == "ready" {
-                ready = true;
-            }
-            if pid.is_some() && ready {
-                break;
-            }
-        }
-        match (pid, ready) {
-            (Some(pid), true) => Ok((child, pid)),
-            _ => Err(format!(
-                "a node process failed to start (see {})",
-                self.dir.supervisor_log().display()
-            )),
-        }
+        crate::enter::spawn(&self.exe, spec, stdin, stdout, stderr)
+            .map_err(|e| format!("{e} (see {})", self.dir.supervisor_log().display()))
     }
 
     pub fn save(&self) {

@@ -188,3 +188,73 @@ fn build_node(setup: &NodeSetup) -> nix::Result<()> {
     nix::unistd::sethostname(&setup.hostname)?;
     Ok(())
 }
+
+/// Spawns `exe __enter` with `spec`'s namespace fds inherited; returns the wrapper and the host
+/// pid of the process inside, once it reported `ready`.
+pub fn spawn(
+    exe: &std::path::Path,
+    mut spec: EnterSpec,
+    stdin: std::process::Stdio,
+    stdout: std::process::Stdio,
+    stderr: std::process::Stdio,
+) -> Result<(std::process::Child, i32), String> {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    let (read, write) = nix::unistd::pipe().map_err(|e| e.to_string())?;
+    spec.report = Some(write.as_raw_fd());
+    let inherit: Vec<RawFd> = [
+        spec.user,
+        spec.mnt,
+        spec.net,
+        spec.uts,
+        spec.pid,
+        spec.report,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let json = serde_json::to_string(&spec).map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("__enter")
+        .arg(json)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr);
+    // SAFETY: only fcntl between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || inherit.iter().try_for_each(|fd| ns::inherit(*fd)));
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("can't start `tpo __enter`: {e}"))?;
+    drop(write);
+
+    let (mut pid, mut ready) = (None, false);
+    for line in std::io::BufReader::new(File::from(read)).lines() {
+        let Ok(line) = line else { break };
+        if let Some(p) = line.strip_prefix("pid ") {
+            pid = p.trim().parse().ok();
+        } else if line == "ready" {
+            ready = true;
+        }
+        if pid.is_some() && ready {
+            break;
+        }
+    }
+    match (pid, ready) {
+        (Some(pid), true) => Ok((child, pid)),
+        _ => {
+            let mut why = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut err, &mut why);
+            }
+            let _ = child.wait();
+            let why = why.trim();
+            Err(if why.is_empty() {
+                "a node process failed to start".to_owned()
+            } else {
+                why.to_owned()
+            })
+        }
+    }
+}

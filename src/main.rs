@@ -109,6 +109,8 @@ enum Cmd {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Check that this machine can run labs.
+    Doctor,
     #[command(hide = true, name = "__supervise")]
     Supervise {
         file: PathBuf,
@@ -157,6 +159,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }),
         Cmd::Up { file, detach: true } => return up_detached(&file),
         Cmd::Down => return down(cli.lab.as_deref()),
+        Cmd::Doctor => return Ok(doctor(cli.json)),
         Cmd::Exec { node, cmd } => exec(&client()?, &node, cmd),
         Cmd::Shell { node } => {
             let shell = std::env::var("SHELL")
@@ -357,5 +360,46 @@ fn logs(lab: Option<&str>, node: &str, follow: bool) -> Result<ExitCode, String>
             return Ok(ExitCode::SUCCESS);
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn doctor(json: bool) -> ExitCode {
+    let checks = tpo::doctor::run();
+    let failed = checks.iter().any(|c| c.required && c.result.is_err());
+    if json {
+        let v: Vec<_> = checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "check": c.name,
+                    "ok": c.result.is_ok(),
+                    "required": c.required,
+                    "detail": match &c.result { Ok(d) | Err(d) => d },
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        for c in &checks {
+            match &c.result {
+                Ok(d) => println!("✓ {}: {d}", c.name),
+                Err(d) if c.required => println!("✗ {}: {d}", c.name),
+                Err(d) => println!("- {}: {d}", c.name),
+            }
+        }
+        println!();
+        println!(
+            "{}",
+            if failed {
+                "this machine can't run labs yet (see ✗ above)"
+            } else {
+                "ready to run labs"
+            }
+        );
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }

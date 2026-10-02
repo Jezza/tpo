@@ -271,6 +271,10 @@ fn show(lab: &Lab) -> Value {
         "nodes": nodes,
         "edges": edges,
         "internet": lab.topo.uses_internet(),
+        "uplink": lab.pasta_pid.map(|pid| json!({
+            "pasta_pid": pid,
+            "alive": std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        })),
     })
 }
 

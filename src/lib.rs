@@ -3,6 +3,7 @@
 pub mod addr;
 pub mod backend;
 pub mod client;
+pub mod doctor;
 pub mod enter;
 pub mod labdir;
 pub mod model;

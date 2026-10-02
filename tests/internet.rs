@@ -81,6 +81,8 @@ fn linked_nodes_reach_the_internet_by_ip_and_by_name() {
         !curl(&lab, "c", &["http://1.1.1.1/"]),
         "c has no internet link"
     );
+    let show = lab.ok(&["show"]);
+    assert!(show.contains("internet: up (pasta pid "), "{show}");
 }
 
 #[test]

@@ -28,6 +28,15 @@ pub fn show(data: &Value) -> String {
             ""
         }
     );
+    if data["internet"].as_bool() == Some(true) {
+        let up = &data["uplink"];
+        let line = match (up["alive"].as_bool(), up["pasta_pid"].as_i64()) {
+            (Some(true), Some(pid)) => format!("internet: up (pasta pid {pid})"),
+            (Some(false), Some(pid)) => format!("internet: DEGRADED (pasta pid {pid} has exited)"),
+            _ => "internet: DEGRADED (no uplink)".to_owned(),
+        };
+        let _ = writeln!(out, "{line}");
+    }
     let width = nodes
         .iter()
         .filter_map(|n| n["name"].as_str())
