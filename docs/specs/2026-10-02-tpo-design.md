@@ -1,7 +1,8 @@
 # tpo — design
 
 Date: 2026-10-02
-Status: draft for review (rev 3 — review findings + IPv6 kept, MAC-based filtering)
+Status: draft for review (rev 4 — review findings, full dual-stack incl. internet via pasta,
+supervisor stays in host namespaces)
 
 ## 1. Purpose
 
@@ -32,14 +33,18 @@ Published on crates.io as `tpo` (name verified free 2026-10-02). Linux only.
 
 ### Non-goals (v1)
 
-IPv6 internet access (the uplink is IPv4-only); restart policies for node processes; topology generators/templates;
-netlink backend; pasta uplink; bridging to physical NICs; ICMP to the internet when rootless.
+Restart policies for node processes; topology generators/templates; netlink backend; slirp4netns
+uplink; bridging to physical NICs; ICMP to the internet when rootless.
 
 ## 2. Privilege model
 
-**Rootless (default).** The supervisor runs `unshare(CLONE_NEWUSER | CLONE_NEWNET)` mapping the
-invoking uid to root, which grants `CAP_NET_ADMIN` over namespaces it owns and nothing else. It
-does this first thing, while still single-threaded.
+**Rootless (default).** The supervisor itself **stays in the host's namespaces**. It creates the
+lab by `clone`-ing a lab init process into new user, network and pid namespaces, mapping the
+invoking uid to root inside. That grants `CAP_NET_ADMIN` over namespaces the lab owns and nothing
+else. The supervisor then works inside the lab only through forked, single-threaded children
+that `setns` into the lab's namespaces (§7.1). It must stay outside because a process inside a
+user namespace cannot `setns` back into the host netns (`EPERM`, verified), and the pasta uplink
+(§6) has to run in the host netns.
 
 Verified on Debian 13 / kernel 7.1.13 (2026-10-02), unprivileged:
 
@@ -49,8 +54,13 @@ Verified on Debian 13 / kernel 7.1.13 (2026-10-02), unprivileged:
 - per-netns `sysctl net.ipv4.ip_forward`, loopback `/32`s, static routes
 - unnumbered veths with `/32`-on-`lo` and `onlink` routes: a→c via b works, source is a's `/32`
 - an outside process joining via `setns` on a userns + a netns held only by an fd
-- slirp4netns uplink + `nft` masquerade in a gateway netns; node reaches internet over TCP
-  (slirp4netns was launched from the host netns — see §6 for how the supervisor does that)
+- pasta uplink (launched from the host netns) + `nft` `inet` masquerade in a gateway netns:
+  a node on the lab's private v4/ULA v6 addresses reaches the internet over **IPv4 and IPv6**, by
+  IP and by name, HTTP and HTTPS
+- slirp4netns 1.3.1 IPv6 is unusable (HTTPS over v6 timed out; RA races static config) —
+  rejected
+- `setns` from inside the user namespace back to the host netns fails with `EPERM` (why the
+  supervisor stays outside)
 - per-node mount namespace bind-mounting `/etc/resolv.conf` and `/etc/hosts`
 - `setns(CLONE_NEWUSER)` / `setns(CLONE_NEWNS)` fail with `EINVAL` from a multithreaded process
   (constraint, see §7.2)
@@ -67,7 +77,7 @@ Known environments where rootless fails (detected by `tpo doctor`, see §8):
 outlive a crashed supervisor; `tpo down --force` kills any processes left in them and deletes them
 using `state.json`.
 
-`ip`, `tc`, `nft`, `slirp4netns` are invoked by absolute path (resolved once at startup, searching
+`ip`, `tc`, `nft`, `pasta` are invoked by absolute path (resolved once at startup, searching
 `/usr/sbin:/sbin:/usr/bin:/bin` and `$PATH`), since `/usr/sbin` is often not on a user's `PATH`.
 
 ## 3. Topology file (TOML)
@@ -117,7 +127,7 @@ to = "internet"
 delay = "30ms"
 
 [internet]
-host_loopback = false     # true: host's 127.0.0.1 reachable as 10.0.2.2
+host_loopback = false     # true: host's loopback reachable as `host` (192.0.2.2 / 2001:db8::2)
 
 [run]
 "*"    = "myrmic runtimes start --tmp --name $TPO_NODE"
@@ -129,7 +139,8 @@ Tables are parsed order-preserving (`toml` with `preserve_order` / `IndexMap`).
 
 ### 3.1 Names and selectors
 
-- Node and group names share one namespace; a clash is an error. `internet` and `*` are reserved.
+- Node and group names share one namespace; a clash is an error. `internet`, `host` and `*` are
+  reserved.
   Names must be valid hostnames (`[a-z0-9-]`, ≤ 63 chars).
 - A **selector** is `*`, a node name, a group name, or a comma list of those (`a,edge`).
   The same syntax is used in the file and on the CLI.
@@ -275,9 +286,11 @@ Each node has its own **network, mount and UTS** namespace, all inside the lab's
 namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 
 - `/proc` is remounted for the lab pid namespace (`ps` shows only the lab's processes).
-- `/etc/hosts`: every node's name → IPv4 and IPv6 address, plus `internet` → gateway. Updated **in place**
+- `/etc/hosts`: every node's name → IPv4 and IPv6 address, plus `internet` → gateway, plus
+  `host` → the host-loopback addresses when `host_loopback = true`. Updated **in place**
   (truncate + write, never rename) so the bind mount keeps pointing at it.
-- `/etc/resolv.conf`: `nameserver 10.0.2.3` when the lab uses `internet`, otherwise empty.
+- `/etc/resolv.conf`: the pasta DNS-forward addresses (`192.0.2.53`, `2001:db8::53`) when the
+  lab uses `internet`, otherwise empty.
 - `/etc/nsswitch.conf`: `hosts: files dns`, so lookups never reach host daemons (avahi/mDNS,
   systemd-resolved, `myhostname`) over unix sockets. Other databases are copied from the host's.
 - hostname (`sethostname`) = node name.
@@ -286,33 +299,47 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 
 - `internet` is a reserved built-in node, created only if some link references it. It behaves
   like any node for links, faults and properties (`tpo cut a internet` = WAN outage, including
-  for already-open connections).
-- Implementation: a hidden gateway namespace with a slirp4netns uplink (`tap0`, NAT to the host's
-  network), `nft` masquerade on `tap0`, and forwarding enabled.
-- **Launching slirp4netns**: the supervisor opens its original `/proc/self/ns/net` *before* its
-  own `unshare`. slirp4netns is spawned with a `pre_exec` that `setns`es back to that host netns,
-  and run as `slirp4netns --netns-type=path <gateway netns path> -c -r <ready-fd>
-  [--disable-host-loopback] tap0`. The supervisor waits on the ready fd before configuring `nft`.
-- **Lifecycle**: slirp4netns runs inside the lab pid namespace and dies with it. Its state is
-  shown in `tpo show`; if it exits, `internet` is marked `degraded` and its edges stop working.
+  for already-open connections). It is **dual-stack**: IPv4 and IPv6 work equally.
+- Implementation: a hidden gateway namespace with a **pasta** uplink, `nft` `inet` masquerade
+  (IPv4 NAT and NAT66) on the uplink interface, and IPv4 + IPv6 forwarding enabled.
+- **pasta** (from `passt`, rootless Podman's default) copies the host's real addresses and routes
+  into the gateway's `tap0` and translates its traffic to host sockets. Lab traffic is
+  masqueraded to those addresses, so it leaves the host as ordinary host traffic over whatever
+  IPv4/IPv6 connectivity the host has.
+- **Launching pasta**: the supervisor (in the host netns, §2) spawns
+  `pasta --config-net -I tap0 --userns <lab userns> --netns <gateway netns>
+  --dns-forward 192.0.2.53 --dns-forward 2001:db8::53 --map-host-loopback <none|192.0.2.2>
+  -P <pidfile>` and waits for it to exit 0 (it daemonises once `tap0` is configured) before
+  configuring `nft`. Exact flags (e.g. the IPv6 host-loopback mapping) are pinned during
+  implementation against the pasta version `doctor` finds.
+- DNS: nodes' `resolv.conf` points at the DNS-forward addresses, which pasta maps to the host's
+  resolver (works even when the host resolver is on `127.0.0.1`). These addresses are from the
+  documentation ranges and route via the gateway's default route, so they never collide with lab
+  addresses.
+- **Lifecycle**: the supervisor tracks pasta by pidfile/pidfd and kills it on `down`; pasta also
+  exits when the gateway netns disappears. If it dies, `internet` is marked `degraded` in
+  `tpo show` and its edges stop working.
 - **Enforcement** is at the gateway (internet traffic carries non-lab addresses):
-  - an nft named set `allowed` holds the addresses of nodes with a live edge to `internet`;
-  - the forward chain checks `ip saddr @allowed` (outbound) and `ip daddr @allowed` (inbound)
-    **before** any `ct state established` accept, so a cut also kills open connections;
+  - nft named sets `allowed4`/`allowed6` hold the addresses of nodes with a live edge to
+    `internet`;
+  - the forward chain checks `saddr` (outbound) and `daddr` (inbound) against them **before** any
+    `ct state established` accept, so a cut also kills open connections;
   - lab→lab forwarding is dropped: nodes linked only to `internet` can meet only via something
     outside the lab (e.g. a lighthouse);
-  - cut/heal = add/delete a set element, plus adding/removing the node's default route.
-- Direct mode: the gateway is on the bridge; linked nodes get `default via <gateway>`. Routed
-  mode: `internet` is a router node at the edge of the graph; linked nodes get a default route
-  along the shortest path.
-- The uplink is IPv4-only: nodes get no IPv6 default route, so IPv6 to the internet fails fast.
+  - cut/heal = add/delete set elements, plus adding/removing the node's IPv4 and IPv6 default
+    routes.
+- Direct mode: the gateway is on the bridge; linked nodes get `default via` the gateway's v4 and
+  v6 addresses. Routed mode: `internet` is a router node at the edge of the graph; linked nodes
+  get default routes along the shortest path.
 - netem for the `internet` edge: on the node's egress toward the gateway (gateway-MAC class, §4.1)
   and on the gateway's egress toward the node.
-- `[internet] host_loopback = true` maps the host's `127.0.0.1` to `10.0.2.2` (otherwise
-  `--disable-host-loopback`).
+- `[internet] host_loopback = true` maps `192.0.2.2` / `2001:db8::2` (resolvable as `host`) to the
+  host's loopback, so a service on the laptop (e.g. a local lighthouse) is reachable.
+- If the host has no IPv6 (or no IPv4) connectivity, that family is unavailable in the lab too;
+  `doctor` reports which families the host has.
 - Rootless ICMP to the internet requires the host's `net.ipv4.ping_group_range` to allow it;
   TCP/UDP always work.
-- slirp4netns (and `/dev/net/tun`) is a runtime dependency only for labs using `internet`.
+- pasta and `/dev/net/tun` are runtime dependencies only for labs using `internet`.
 
 ## 7. Runtime: supervisor and CLI
 
@@ -322,26 +349,34 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
 
 - `tpo up lab.toml` runs in the foreground (Ctrl-C tears down); `tpo up -d` re-execs as hidden
   `tpo __supervise`, detaches, and returns once the lab is ready.
-- Startup, while single-threaded:
-  1. open host netns fd (for slirp4netns, §6)
-  2. `unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)` and write uid/gid maps
-  3. fork the **lab init**: `tpo __init`, pid 1 of the lab pid namespace. It reaps zombies and
-     has `PR_SET_PDEATHSIG(SIGKILL)` set by the (permanent) main thread of the supervisor. When
-     it dies, the kernel SIGKILLs every process in the pid namespace.
-- Only then does the supervisor start its async runtime.
-- **All forks** (node setup, node processes, `ip`/`tc` invocations, slirp4netns) happen on one
+- The supervisor process **stays in the host namespaces** for its whole life (§2).
+- Startup, from the supervisor's main thread before its async runtime starts:
+  1. `clone(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)` the **lab init** (`tpo __init`), which
+     is pid 1 of the lab pid namespace; write its uid/gid maps.
+  2. The init sets `PR_SET_PDEATHSIG(SIGKILL)` (its parent thread is the supervisor's permanent
+     main thread), then just reaps zombies. When it dies, the kernel SIGKILLs every process in the
+     lab pid namespace.
+  3. The supervisor opens fds on the init's `ns/{user,net,pid}`; the init's netns is the hub
+     (bridge) and gateway namespace.
+- **All forks** (node setup, node processes, `ip`/`tc`/`nft` invocations, pasta) happen on one
   dedicated, never-exiting spawner thread, so PDEATHSIG and thread-lifetime surprises cannot
-  occur. Children `setns` into the target node's namespaces in `pre_exec` (a forked child is
-  single-threaded, so this is allowed).
-- Node setup: a short-lived child per node unshares net+mnt+uts, sets up mounts/hostname/sysctls,
-  and exits after the supervisor has opened fds on its `ns/{net,mnt,uts}`.
-- Node processes (from `run`) are started in their own process group; `stop` signals the group.
+  occur.
+  - `ip`/`tc`/`nft`: the forked child `setns`es user → net (target node or hub) in `pre_exec` (a
+    forked child is single-threaded, so joining the user namespace is allowed) and execs.
+  - pasta: spawned without any `setns`; it joins the gateway netns itself (§6).
+  - Node setup: a child joins the lab user + pid namespaces via `tpo __enter`, unshares
+    net + mnt + uts, sets up mounts/hostname/sysctls, and stays as a tiny holder until the
+    supervisor has opened fds on its `ns/{net,mnt,uts}`, then exits.
+  - Node processes (from `run`): `tpo __enter <node> -- sh -c <cmd>` (§7.2), in their own
+    process group; `stop` signals the group.
 - Lab directory `$XDG_RUNTIME_DIR/tpo/<lab>/` (root mode: `/run/tpo/<lab>/`): `pid`, `ctl.sock`,
   `state.json` (spec, faults, address allocations), `logs/`.
-- `tpo down`: kill the lab init (→ every lab process, including open `tpo exec`/`shell`
+- `tpo down`: kill pasta and the lab init (→ every lab process, including open `tpo exec`/`shell`
   sessions, dies), close fds (→ namespaces and interfaces go away), remove the lab dir.
 - Supervisor crash or `kill -9`: the lab init gets PDEATHSIG, so the same cleanup happens via the
-  kernel. Nothing is left behind rootless.
+  kernel; pasta exits when its netns disappears. Nothing is left behind rootless.
+- Root mode: same structure without the user namespace; nodes' netns are additionally bind-mounted
+  under `/run/netns/tpo-<lab>-<node>`.
 
 ### 7.2 Protocol and the CLI
 
@@ -349,8 +384,9 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   with the effective diff or an error. The supervisor serialises requests; only it runs `ip`/`tc`.
 - **The CLI is plain blocking Rust (no async runtime)**, so it stays single-threaded, which
   `setns` into user/mount namespaces requires.
-- `exec`/`shell`: the CLI asks the supervisor for the node's namespace fds (user, mnt, net, uts,
-  pid), received via `SCM_RIGHTS` over `ctl.sock` (works under `hidepid`), then:
+- `exec`/`shell` and the supervisor's node processes share one routine, `tpo __enter`: get the
+  node's namespace fds (user, mnt, net, uts, pid) — the CLI receives them via `SCM_RIGHTS` over
+  `ctl.sock` (works under `hidepid`), the supervisor passes them as inherited fds — then:
   1. `setns` user → mnt → net → uts → pid, before anything could spawn a thread
   2. `chdir` back to the original cwd (`setns(mnt)` resets it to `/`; falls back to `/`)
   3. fork (the pid namespace applies to children) and exec the command in the child with the
@@ -429,8 +465,8 @@ state (`resync`).
   malformed values, `oneway` to `internet`, address clashes, undersized subnets → precise error,
   nothing changed.
 - **`tpo doctor`** (also run by `up`) probes userns creation, caps inside it, veth/bridge,
-  netem/HTB/u32/flower, mount and pid namespaces, tool paths, and slirp4netns + `/dev/net/tun` +
-  nft when `internet` is used. Each failure maps to a cause and fix (e.g. "AppArmor restricts
+  netem/HTB/flower, mount and pid namespaces, tool paths, and pasta + `/dev/net/tun` + nft +
+  host IPv4/IPv6 connectivity when `internet` is used. Each failure maps to a cause and fix (e.g. "AppArmor restricts
   unprivileged user namespaces: run with `--root`, or set
   `kernel.apparmor_restrict_unprivileged_userns=0`").
 - **Failure while applying**: resync each affected node to the *previous* effective state. If that
@@ -481,8 +517,9 @@ Licence: MIT OR Apache-2.0.
      ARP (`arping`), NDP, and raw frames; IPv6 between neighbours gets the link's delay;
    - routed multi-hop works over IPv4 and IPv6, failover after a cut, `--oneway` cut;
    - `--for` heals on time;
-   - `internet`: reachable over TCP while nodes stay mutually isolated; `cut a internet` kills an
-     open connection;
+   - `internet`: reachable over IPv4 and IPv6 (TCP/UDP, by name and by IP) while nodes stay
+     mutually isolated; `cut a internet` kills an open connection on both families;
+     `host_loopback` reaches a listener on the host;
    - names resolve from `/etc/hosts`, and lookups never leave the node (no host avahi/resolved);
    - `kill -9` of the supervisor and `tpo down` leave no processes, namespaces or interfaces,
      including with an open `tpo shell`.
