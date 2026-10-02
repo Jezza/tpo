@@ -1,7 +1,7 @@
 # tpo — design
 
 Date: 2026-10-02
-Status: draft for review (rev 2 — folds in review findings)
+Status: draft for review (rev 3 — review findings + IPv6 kept, MAC-based filtering)
 
 ## 1. Purpose
 
@@ -22,8 +22,8 @@ Published on crates.io as `tpo` (name verified free 2026-10-02). Linux only.
 - Live changes (`cut`, `set`, `heal`, `apply`, `stop`/`start`) take effect without tearing down
   the lab and without disturbing unrelated links.
 - Measured behaviour matches the spec: one-way latency ≈ configured `delay` (so RTT over a link
-  with `delay = "20ms"` both ways ≈ 40ms); unlinked pairs exchange no packets at all (IPv4, ARP
-  or otherwise).
+  with `delay = "20ms"` both ways ≈ 40ms); unlinked pairs exchange no frames at all (IPv4, IPv6,
+  ARP/NDP or otherwise).
 - Nodes can be given internet access while staying isolated from each other.
 - Tearing down, or killing the supervisor, leaves no processes, namespaces or interfaces behind
   (rootless).
@@ -32,7 +32,7 @@ Published on crates.io as `tpo` (name verified free 2026-10-02). Linux only.
 
 ### Non-goals (v1)
 
-IPv6 (disabled inside nodes); restart policies for node processes; topology generators/templates;
+IPv6 internet access (the uplink is IPv4-only); restart policies for node processes; topology generators/templates;
 netlink backend; pasta uplink; bridging to physical NICs; ICMP to the internet when rootless.
 
 ## 2. Privilege model
@@ -76,6 +76,7 @@ using `state.json`.
 name   = "chain"          # default: file stem
 mode   = "direct"         # "direct" | "routed"
 subnet = "10.77.0.0/24"   # default 10.77.0.0/24
+subnet6 = "fd77::/64"     # default fd77::/64 (ULA)
 
 [defaults]                # applied to every link before any [[link]]
 delay = "1ms"
@@ -169,10 +170,14 @@ direction of an earlier bidirectional link.
 
 ### 3.4 Addresses
 
-- Node addresses come from `subnet` in declaration order, skipping explicit `addr`s and the
-  addresses reserved for the gateway (`.254`) and bridge. The subnet must fit all nodes. Clashes
-  are errors.
-- **Allocations are persisted** in `state.json`: on `apply`, existing nodes keep their address;
+- Nodes are **dual-stack**. IPv4 addresses come from `subnet` in declaration order, skipping
+  explicit `addr`s and the addresses reserved for the gateway (`.254`). The subnet must fit all
+  nodes. Clashes are errors.
+- Each node's IPv6 address is `subnet6` + the same host index (`fd77::1` for `10.77.0.1`); an
+  explicit `addr6` overrides it.
+- Direct mode: each node's `eth0` MAC is deterministic, `02:74:70:<lab hash>:<index>` (locally
+  administered), so filters can key on MACs (§4.1). The gateway gets index 254.
+- **Allocations are persisted** in `state.json`: on `apply`, existing nodes keep their addresses;
   new nodes get the lowest free one; removed nodes free theirs. An explicit `addr` that differs
   from the current one changes it.
 - A node's **index** (for tc handles/prefs) is the host part of its address, so handles are
@@ -191,14 +196,16 @@ direction of an earlier bidirectional link.
     (resolved by adding a node entry)
   - unknown names
 - `""` means run nothing.
-- Environment: `TPO_LAB`, `TPO_NODE`, `TPO_ADDR`, and `TPO_ADDR_<NODE>` for every node
+- Environment: `TPO_LAB`, `TPO_NODE`, `TPO_ADDR`, `TPO_ADDR6`, and `TPO_ADDR_<NODE>` /
+  `TPO_ADDR6_<NODE>` for every node
   (uppercased, `-` → `_`). `tpo exec`/`shell` get the same variables.
 - stdout/stderr → `<labdir>/logs/<node>.log`.
 
 ## 4. Network modes
 
-Common to both modes, in every node: `lo` up; `net.ipv6.conf.all.disable_ipv6=1` (and
-`default`); `rp_filter=0` set explicitly.
+Common to both modes, in every node: `lo` up; IPv6 enabled; `rp_filter=0` set explicitly;
+IPv6 DAD disabled (`accept_dad=0`, addresses are unique by construction) so addresses are usable
+immediately.
 
 ### 4.1 `direct` — reachability = adjacency
 
@@ -214,21 +221,24 @@ Common to both modes, in every node: `lo` up; `net.ipv6.conf.all.disable_ipv6=1`
   very large `rate`/`ceil`; shaping is done by netem `rate`). Default class = unshaped.
   - One class + netem child per directed edge from this node, **always installed** (even if all
     properties are zero), so every runtime property change is a `tc qdisc change`.
-  - A `u32` filter on destination address per peer, `pref` = peer index (O(1) delete).
-  - Subnet broadcast and `224.0.0.0/4` go to the default class via higher-priority filters, so
-    broadcast/multicast are **not** shaped by link properties (documented limitation).
-  - Edge to `internet` (§6): its class gets the lowest-priority catch-all filter
-    (`dst 0.0.0.0/0`), since internet-bound packets carry real destination addresses.
+  - Classification is by **destination MAC** (`flower dst_mac`, `protocol all`), one filter per
+    peer, `pref` = peer index (O(1) delete). This is protocol-agnostic: IPv4, IPv6, ARP and NDP
+    to a peer all take that peer's class.
+  - Broadcast and multicast MACs match no peer filter and fall to the default class, so they are
+    **not** shaped by link properties (documented limitation).
+  - Edge to `internet` (§6): its class matches the gateway's MAC, which every internet-bound
+    frame carries regardless of its destination IP.
   - netem `limit` is set large (e.g. 10000 packets, or from rate × delay when both are set) so
     long fat links don't tail-drop at the default 1000.
-- **Ingress (reachability) is an allowlist** on `eth0` via `clsact`:
-  - accept IPv4 whose source is a node with a live edge *to* this node;
-  - accept ARP whose sender IP (`arp_sip`) is such a node;
-  - accept anything from the gateway's MAC if this node has a live edge from `internet`;
-  - drop everything else (other IPv4, ARP from non-neighbours, IPv6, any other ethertype).
+- **Ingress (reachability) is an allowlist by source MAC** on `eth0` via `clsact`
+  (`flower src_mac`, `protocol all`):
+  - accept frames from the MAC of each node with a live edge *to* this node;
+  - accept frames from the gateway's MAC if this node has a live edge from `internet`;
+  - drop everything else.
 
-  Filtering at the receiver also confines broadcast/multicast discovery to neighbours, and makes
-  non-neighbours invisible even at L2 (`arping` fails).
+  One rule per neighbour covers IPv4, IPv6, ARP, NDP and anything else. Filtering at the
+  receiver also confines broadcast/multicast discovery (including IPv6 link-local and mDNS) to
+  neighbours, and makes non-neighbours invisible at L2 (`arping`/`ndisc6` fail).
 - No IP forwarding: a node reaches only nodes it has an edge to. Multi-hop delivery is the
   application's job.
 - Setup and multi-op changes are applied with `tc -batch` per node (N² filters otherwise means N²
@@ -246,10 +256,13 @@ Common to both modes, in every node: `lo` up; `net.ipv6.conf.all.disable_ipv6=1`
 - Routes: to each neighbour `ip route add <nbr>/32 dev <veth>`; to each further node
   `ip route add <dst>/32 via <next-hop> dev <veth> onlink`, along the shortest path over live
   directed edges (`metric`). The source address is the node's `/32` (verified).
+- IPv6 likewise: each node's `/128` on `lo`; veths carry only their link-local address, which is
+  deterministic because tpo sets each veth's MAC; routes are
+  `ip -6 route add <dst>/128 via fe80::<next-hop LL> dev <veth>`.
 - **`internet` is never a transit hop** in path computation (the gateway drops lab→lab traffic).
 - netem on each veth's egress, per direction (same class-per-edge rules as §4.1, one peer per
   veth so no classifier needed).
-- **Cut** = per-direction drop filter on the receiving veth's ingress (so `--oneway` works, and
+- **Cut** = per-direction drop-all filter (`protocol all`) on the receiving veth's ingress (so `--oneway` works, and
   packets are dropped silently as in direct mode), followed by route recompute.
   - If an alternate path exists, routes move to it.
   - If no path exists, the previous route is **kept**, so packets travel to the cut and are
@@ -262,7 +275,7 @@ Each node has its own **network, mount and UTS** namespace, all inside the lab's
 namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 
 - `/proc` is remounted for the lab pid namespace (`ps` shows only the lab's processes).
-- `/etc/hosts`: every node's name → address, plus `internet` → gateway. Updated **in place**
+- `/etc/hosts`: every node's name → IPv4 and IPv6 address, plus `internet` → gateway. Updated **in place**
   (truncate + write, never rename) so the bind mount keeps pointing at it.
 - `/etc/resolv.conf`: `nameserver 10.0.2.3` when the lab uses `internet`, otherwise empty.
 - `/etc/nsswitch.conf`: `hosts: files dns`, so lookups never reach host daemons (avahi/mDNS,
@@ -292,7 +305,8 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - Direct mode: the gateway is on the bridge; linked nodes get `default via <gateway>`. Routed
   mode: `internet` is a router node at the edge of the graph; linked nodes get a default route
   along the shortest path.
-- netem for the `internet` edge: on the node's egress toward the gateway (catch-all class, §4.1)
+- The uplink is IPv4-only: nodes get no IPv6 default route, so IPv6 to the internet fails fast.
+- netem for the `internet` edge: on the node's egress toward the gateway (gateway-MAC class, §4.1)
   and on the gateway's egress toward the node.
 - `[internet] host_loopback = true` maps the host's `127.0.0.1` to `10.0.2.2` (otherwise
   `--disable-host-loopback`).
@@ -463,8 +477,9 @@ Licence: MIT OR Apache-2.0.
 3. **Integration (needs userns; feature/env gated)**: real labs, measured:
    - one-way delay ≈ configured (RTT ≈ sum of both directions) within tolerance; loss roughly
      matches;
-   - direct-mode non-neighbours exchange nothing: IPv4, ARP (`arping`), and raw frames;
-   - routed multi-hop works, failover after a cut, `--oneway` cut;
+   - direct-mode non-neighbours exchange nothing: IPv4, IPv6 (incl. link-local multicast),
+     ARP (`arping`), NDP, and raw frames; IPv6 between neighbours gets the link's delay;
+   - routed multi-hop works over IPv4 and IPv6, failover after a cut, `--oneway` cut;
    - `--for` heals on time;
    - `internet`: reachable over TCP while nodes stay mutually isolated; `cut a internet` kills an
      open connection;
