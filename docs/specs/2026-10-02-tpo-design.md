@@ -339,7 +339,19 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
   `doctor` reports which families the host has.
 - Rootless ICMP to the internet requires the host's `net.ipv4.ping_group_range` to allow it;
   TCP/UDP always work.
-- pasta and `/dev/net/tun` are runtime dependencies only for labs using `internet`.
+- pasta and `/dev/net/tun` are runtime dependencies only for rootless labs using `internet`.
+- **Root mode does not use pasta.** The gateway gets a veth pair into the host netns
+  (`tpo-<lab>-up`), the host side gets addresses from a per-lab transit range, and the host does
+  NAT in the kernel: an `nft` table `tpo-<lab>` with `inet` masquerade out of the host's default
+  route interfaces, plus `net.ipv4.ip_forward` / `net.ipv6.conf.all.forwarding` enabled. `down`
+  (and `down --force`) remove the veth and the nft table. DNS forward addresses are DNATed to the
+  host's resolvers by that table; `host_loopback` maps to the host-side veth address.
+- **Decision — run pasta as a binary, don't link a library.** This is how rootless Podman
+  (`containers/common`) and rootlesskit use pasta/slirp4netns. passt has no library API and is
+  GPL-2.0-or-later. The linkable alternatives were rejected: libslirp (slower, weak IPv6),
+  smoltcp (a stack, not a translator — we'd own the TCP translation edge cases),
+  ipstack/netstack-smoltcp (immature), gVisor netstack (Go). Revisit a smoltcp-based built-in
+  uplink behind the same interface only if the pasta dependency becomes a real problem.
 
 ## 7. Runtime: supervisor and CLI
 
