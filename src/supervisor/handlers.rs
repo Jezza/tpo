@@ -77,7 +77,7 @@ pub fn handle(shared: &Shared, request: Request) -> Response {
             }
         }),
         Request::Resync { selector } => resync(shared, selector.as_deref()),
-        Request::Apply { .. } => Err("`apply` is not implemented yet".to_owned()),
+        Request::Apply { path, source } => apply(shared, &path, &source),
         Request::Down | Request::Enter { .. } => unreachable!("handled by the server"),
     };
     match result {
@@ -285,4 +285,112 @@ fn explain(lab: &Lab, node: &str) -> Result<Value, String> {
         .map(ToString::to_string)
         .collect();
     Ok(json!({ "ops": lines }))
+}
+
+/// Replaces the spec (spec §7.4 `apply`): adds and removes nodes and links, keeps faults for
+/// edges that still exist, and restarts a node's process only if its command changed.
+fn apply(shared: &Shared, path: &str, source: &str) -> Outcome {
+    let stem = std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (removed, restart) = {
+        let lab = shared.lock().unwrap();
+        let next = Topology::parse(source, &stem).map_err(|e| format!("{path}: {e}"))?;
+        if next.name != lab.topo.name {
+            return Err(format!(
+                "{path} describes lab `{}`, not `{}` (set `name`)",
+                next.name, lab.topo.name
+            ));
+        }
+        if next.mode != lab.topo.mode {
+            return Err("changing `mode` needs a restart (`tpo down` and `tpo up`)".to_owned());
+        }
+        let addrs =
+            crate::addr::allocate(&next, Some(&lab.addrs)).map_err(|e| format!("{path}: {e}"))?;
+        for (node, a) in &lab.addrs.nodes {
+            if addrs.nodes.get(node).is_some_and(|b| b != a) {
+                return Err(format!("changing `{node}`'s address needs a restart"));
+            }
+        }
+        let removed: Vec<String> = lab
+            .topo
+            .nodes
+            .keys()
+            .filter(|n| !next.nodes.contains_key(*n))
+            .cloned()
+            .collect();
+        let restart: Vec<String> = next
+            .nodes
+            .keys()
+            .filter(|n| {
+                lab.topo.nodes.contains_key(*n) && lab.topo.run_command(n) != next.run_command(n)
+            })
+            .cloned()
+            .collect();
+        (removed, restart)
+    };
+
+    for node in removed.iter().chain(&restart) {
+        procs::stop(
+            shared,
+            node,
+            nix::sys::signal::Signal::SIGKILL,
+            Duration::from_secs(2),
+        );
+    }
+
+    let (changes, added) = {
+        let mut lab = shared.lock().unwrap();
+        let next = Topology::parse(source, &stem).map_err(|e| format!("{path}: {e}"))?;
+        let addrs =
+            crate::addr::allocate(&next, Some(&lab.addrs)).map_err(|e| format!("{path}: {e}"))?;
+        let added: Vec<String> = next
+            .nodes
+            .keys()
+            .filter(|n| !lab.topo.nodes.contains_key(*n))
+            .cloned()
+            .collect();
+
+        for node in &removed {
+            lab.procs.shift_remove(node);
+            lab.nodes.shift_remove(&Target::node(node));
+        }
+        let had_internet = lab.topo.uses_internet();
+        if had_internet
+            && !next.uses_internet()
+            && let Some(mut gw) = lab.nodes.shift_remove(&Target::Gateway)
+            && let Some(mut holder) = gw.holder.take()
+        {
+            let _ = holder.kill();
+            let _ = holder.wait();
+        }
+
+        let old_eff = lab.eff.clone();
+        lab.topo = next;
+        lab.addrs = addrs;
+        let lab = &mut *lab;
+        lab.faults.retain_edges(&lab.topo);
+        super::files::write_etc(&lab.dir, &lab.topo, &lab.addrs).map_err(|e| e.to_string())?;
+        for node in &added {
+            let ns = super::spawn_holder(lab, node, false)?;
+            lab.nodes.insert(Target::node(node), ns);
+        }
+        if !had_internet && lab.topo.uses_internet() {
+            let ns = super::spawn_holder(lab, "gateway", true)?;
+            lab.nodes.insert(Target::Gateway, ns);
+        }
+        let mut changes: Vec<String> = removed.iter().map(|n| format!("remove node {n}")).collect();
+        changes.extend(added.iter().map(|n| format!("add node {n}")));
+        lab.eff = old_eff;
+        changes.extend(lab.reconcile()?);
+        lab.file = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+        lab.save();
+        (changes, added)
+    };
+
+    for node in added.iter().chain(&restart) {
+        let _ = procs::start(shared, node);
+    }
+    Ok((changes, Value::Null))
 }

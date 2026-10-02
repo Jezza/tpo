@@ -432,7 +432,13 @@ fn diff_node(t: &Target, old: Option<&NodeNet>, new: &NodeNet) -> Vec<Op> {
 /// Operations from `old` to `new`. Endpoints only in `new` are created; endpoints only in `old`
 /// need no operations (their namespaces are destroyed, taking their interfaces with them).
 pub fn diff(old: &Desired, new: &Desired) -> Vec<Op> {
-    let mut ops = Vec::new();
+    // Namespaces are destroyed asynchronously, so remove a gone endpoint's bridge port first:
+    // a new endpoint may reuse its index (and so its port name) in this same diff.
+    let mut ops: Vec<Op> = old
+        .iter()
+        .filter(|(t, _)| !new.contains_key(*t))
+        .map(|(_, net)| Op::ip(&Target::Hub, format!("link del v{}", net.own.index)))
+        .collect();
     for (t, net) in new {
         match old.get(t) {
             Some(o) if o.own == net.own => ops.extend(diff_node(t, Some(o), net)),
@@ -627,6 +633,19 @@ mod tests {
         assert_eq!(
             netem_args(&props)[..2],
             ["limit".to_owned(), "33334".to_owned()]
+        );
+    }
+
+    #[test]
+    fn removed_endpoints_lose_their_bridge_port_and_neighbour_entries() {
+        let before = plan(&topo(CHAIN), &Faults::default());
+        let smaller = topo("[nodes]\na={}\nb={}\n[[link]]\npath=[\"a\",\"b\"]\ndelay=\"10ms\"\n");
+        let after = plan(&smaller, &Faults::default());
+        let ops = rendered(&diff(&before, &after));
+        assert!(ops.contains(&"hub: ip link del v3".to_owned()), "{ops:?}");
+        assert!(
+            ops.contains(&"b: ip neigh del 10.77.0.3 dev eth0".to_owned()),
+            "{ops:?}"
         );
     }
 

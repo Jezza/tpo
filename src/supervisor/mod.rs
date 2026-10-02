@@ -231,7 +231,7 @@ fn build(lab: &mut Lab) -> Result<(), String> {
 }
 
 /// Starts a namespace holder in the lab's user and pid namespaces and opens its namespaces.
-fn spawn_holder(lab: &Lab, hostname: &str, keep: bool) -> Result<NodeNs, String> {
+pub(super) fn spawn_holder(lab: &Lab, hostname: &str, keep: bool) -> Result<NodeNs, String> {
     let etc = lab.dir.etc();
     let mut binds = vec![
         (etc.join("hosts"), PathBuf::from("/etc/hosts")),
