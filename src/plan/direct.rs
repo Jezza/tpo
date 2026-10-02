@@ -196,14 +196,14 @@ fn neighbour_ops(t: &Target, n: &Iface, add: bool) -> Vec<Op> {
             Op::ip(
                 t,
                 format!(
-                    "-6 neigh replace {} lladdr {mac} dev {DEV} nud permanent",
+                    "neigh replace {} lladdr {mac} dev {DEV} nud permanent",
                     n.v6
                 ),
             ),
             Op::ip(
                 t,
                 format!(
-                    "-6 neigh replace {} lladdr {mac} dev {DEV} nud permanent",
+                    "neigh replace {} lladdr {mac} dev {DEV} nud permanent",
                     n.link_local()
                 ),
             ),
@@ -211,8 +211,8 @@ fn neighbour_ops(t: &Target, n: &Iface, add: bool) -> Vec<Op> {
     } else {
         vec![
             Op::ip(t, format!("neigh del {} dev {DEV}", n.v4)),
-            Op::ip(t, format!("-6 neigh del {} dev {DEV}", n.v6)),
-            Op::ip(t, format!("-6 neigh del {} dev {DEV}", n.link_local())),
+            Op::ip(t, format!("neigh del {} dev {DEV}", n.v6)),
+            Op::ip(t, format!("neigh del {} dev {DEV}", n.link_local())),
         ]
     }
 }
@@ -248,6 +248,52 @@ fn allow_op(t: &Target, idx: u32, mac: Mac) -> Op {
     )
 }
 
+/// The tc roots: an HTB classifier with an unshaped default class, and a default-drop ingress.
+fn base_tc(t: &Target) -> Vec<Op> {
+    vec![
+        Op::tc(
+            t,
+            format!("qdisc add dev {DEV} root handle 1: htb default {DEFAULT_CLASS}"),
+        ),
+        Op::tc(
+            t,
+            format!("class add dev {DEV} parent 1: classid 1:{DEFAULT_CLASS} {CLASS}"),
+        ),
+        Op::tc(t, format!("qdisc add dev {DEV} clsact")),
+        Op::tc(
+            t,
+            format!(
+                "filter add dev {DEV} ingress pref {DROP_PREF} protocol all matchall action drop"
+            ),
+        ),
+    ]
+}
+
+/// Clears an endpoint's tc, neighbour and default-route state back to the bare tc roots.
+pub fn reset_ops(t: &Target) -> Vec<Op> {
+    let mut ops = vec![
+        Op::tc(t, format!("qdisc del dev {DEV} root")),
+        Op::tc(t, format!("qdisc del dev {DEV} clsact")),
+        Op::ip(t, format!("neigh flush dev {DEV}")),
+        Op::ip(t, "route flush exact 0.0.0.0/0"),
+        Op::ip(t, "route flush exact ::/0"),
+    ];
+    ops.extend(base_tc(t));
+    ops
+}
+
+/// After [`reset_ops`]: everything that makes up `net`.
+pub fn diff_from_reset(t: &Target, net: &NodeNet) -> Vec<Op> {
+    diff_node(t, None, net)
+}
+
+/// The full set of operations that produce `net` from an empty namespace (`tpo explain`).
+pub fn explain_ops(t: &Target, net: &NodeNet) -> Vec<Op> {
+    let mut ops = setup_ops(t, &net.own);
+    ops.extend(diff_node(t, None, net));
+    ops
+}
+
 /// Creates an endpoint's interface, addresses and tc roots.
 fn setup_ops(t: &Target, own: &Iface) -> Vec<Op> {
     let mut ops = vec![
@@ -280,22 +326,8 @@ fn setup_ops(t: &Target, own: &Iface) -> Vec<Op> {
             format!("link set v{} master br0 up", own.index),
         ),
         Op::ip(t, format!("link set {DEV} up")),
-        Op::tc(
-            t,
-            format!("qdisc add dev {DEV} root handle 1: htb default {DEFAULT_CLASS}"),
-        ),
-        Op::tc(
-            t,
-            format!("class add dev {DEV} parent 1: classid 1:{DEFAULT_CLASS} {CLASS}"),
-        ),
-        Op::tc(t, format!("qdisc add dev {DEV} clsact")),
-        Op::tc(
-            t,
-            format!(
-                "filter add dev {DEV} ingress pref {DROP_PREF} protocol all matchall action drop"
-            ),
-        ),
     ];
+    ops.extend(base_tc(t));
     if *t == Target::Gateway {
         ops.push(Op::sysctl(t, "net.ipv4.ip_forward", "1"));
         ops.push(Op::sysctl(t, "net.ipv6.conf.all.forwarding", "1"));
@@ -386,14 +418,11 @@ fn diff_node(t: &Target, old: Option<&NodeNet>, new: &NodeNet) -> Vec<Op> {
                 t,
                 format!("route replace default via {v4} dev {DEV}"),
             ));
-            ops.push(Op::ip(
-                t,
-                format!("-6 route replace default via {v6} dev {DEV}"),
-            ));
+            ops.push(Op::ip(t, format!("route replace ::/0 via {v6} dev {DEV}")));
         }
         (Some(_), None) => {
             ops.push(Op::ip(t, "route del default"));
-            ops.push(Op::ip(t, "-6 route del default"));
+            ops.push(Op::ip(t, "route del ::/0"));
         }
         _ => {}
     }
@@ -501,8 +530,8 @@ mod tests {
             "a: ip addr add fe80::1/64 dev eth0 nodad".to_owned(),
             "hub: ip link set v1 master br0 up".to_owned(),
             format!("a: ip neigh replace 10.77.0.2 lladdr {b_mac} dev eth0 nud permanent"),
-            format!("a: ip -6 neigh replace fd77::2 lladdr {b_mac} dev eth0 nud permanent"),
-            format!("a: ip -6 neigh replace fe80::2 lladdr {b_mac} dev eth0 nud permanent"),
+            format!("a: ip neigh replace fd77::2 lladdr {b_mac} dev eth0 nud permanent"),
+            format!("a: ip neigh replace fe80::2 lladdr {b_mac} dev eth0 nud permanent"),
             "a: tc qdisc add dev eth0 root handle 1: htb default fffe".to_owned(),
             "a: tc filter add dev eth0 ingress pref 65535 protocol all matchall action drop".to_owned(),
             "a: tc class add dev eth0 parent 1: classid 1:2 htb rate 10gbit ceil 10gbit quantum 200000".to_owned(),
@@ -632,10 +661,7 @@ mod tests {
             ops.contains(&"a: ip route del default".to_owned()),
             "{ops:?}"
         );
-        assert!(
-            ops.contains(&"a: ip -6 route del default".to_owned()),
-            "{ops:?}"
-        );
+        assert!(ops.contains(&"a: ip route del ::/0".to_owned()), "{ops:?}");
         assert!(
             ops.contains(&"gateway: tc filter del dev eth0 ingress pref 1".to_owned()),
             "{ops:?}"

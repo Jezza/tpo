@@ -84,6 +84,27 @@ pub struct InternetSpec {
     pub host_loopback: bool,
 }
 
+/// Serialises `IndexMap<Edge, T>` as a list of `[edge, value]` pairs (JSON object keys must be
+/// strings).
+pub mod edge_map {
+    use super::Edge;
+    use indexmap::IndexMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        map: &IndexMap<Edge, T>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_seq(map.iter())
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<IndexMap<Edge, T>, D::Error> {
+        Ok(Vec::<(Edge, T)>::deserialize(d)?.into_iter().collect())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Topology {
     pub name: String,
@@ -93,6 +114,7 @@ pub struct Topology {
     pub subnet6: Ipv6Net,
     pub nodes: IndexMap<String, NodeSpec>,
     pub groups: IndexMap<String, Vec<String>>,
+    #[serde(with = "edge_map")]
     pub edges: IndexMap<Edge, LinkProps>,
     pub internet: InternetSpec,
     /// Resolved `run` command per node; `None` means run nothing.

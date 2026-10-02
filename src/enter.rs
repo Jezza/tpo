@@ -1,0 +1,190 @@
+//! Entering a node: `tpo __enter`, node processes and `tpo exec`/`shell` (spec §7.1, §7.2).
+
+use crate::ns;
+use nix::mount::{MsFlags, mount};
+use nix::sched::{CloneFlags, unshare};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, fork};
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// Builds a fresh node: new net, mount and UTS namespaces, `/proc` for the lab pid namespace,
+/// bind-mounted `/etc` files and the hostname (spec §5).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NodeSetup {
+    pub hostname: String,
+    /// `(source, target)` bind mounts.
+    pub binds: Vec<(PathBuf, PathBuf)>,
+}
+
+/// What to enter and run. Namespace fields are inherited fds, joined in field order.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EnterSpec {
+    pub user: Option<RawFd>,
+    pub mnt: Option<RawFd>,
+    pub net: Option<RawFd>,
+    pub uts: Option<RawFd>,
+    pub pid: Option<RawFd>,
+    pub setup: Option<NodeSetup>,
+    /// Receives `pid <host pid>` from the wrapper and `ready` from the child.
+    pub report: Option<RawFd>,
+    /// Instead of running a command, wait until stdin closes (a namespace holder).
+    pub hold: bool,
+    /// Put the child in its own process group (node processes, so `stop` can signal it).
+    pub setpgid: bool,
+    /// An interactive session: SIGINT/SIGQUIT reach the child via the tty already.
+    pub interactive: bool,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+    pub cmd: Vec<String>,
+}
+
+static CHILD: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn forward(sig: i32) {
+    let child = CHILD.load(Ordering::SeqCst);
+    if child > 0 {
+        // SAFETY: kill is async-signal-safe.
+        unsafe { nix::libc::kill(child, sig) };
+    }
+}
+
+fn fail(msg: impl std::fmt::Display) -> ! {
+    eprintln!("tpo: {msg}");
+    std::process::exit(126);
+}
+
+/// Enters the namespaces in `spec` and runs (or holds) there; exits with the child's status.
+/// The calling process must be single-threaded.
+pub fn enter(spec: &EnterSpec) -> ! {
+    let original_cwd = std::env::current_dir().ok();
+    let joins: Vec<(RawFd, CloneFlags)> = [
+        (spec.user, CloneFlags::CLONE_NEWUSER),
+        (spec.mnt, CloneFlags::CLONE_NEWNS),
+        (spec.net, CloneFlags::CLONE_NEWNET),
+        (spec.uts, CloneFlags::CLONE_NEWUTS),
+        (spec.pid, CloneFlags::CLONE_NEWPID),
+    ]
+    .into_iter()
+    .filter_map(|(fd, kind)| fd.map(|fd| (fd, kind)))
+    .collect();
+    if let Err(e) = ns::join(&joins) {
+        fail(format!("can't enter the node's namespaces: {e}"));
+    }
+    let cwd = spec.cwd.clone().or(original_cwd);
+    if cwd
+        .as_ref()
+        .is_none_or(|d| std::env::set_current_dir(d).is_err())
+    {
+        let _ = std::env::set_current_dir("/");
+    }
+
+    let mut report = spec.report.map(|fd| unsafe { File::from_raw_fd(fd) });
+
+    // SAFETY: single-threaded (see above), so fork is sound.
+    match unsafe { fork() } {
+        Err(e) => fail(format!("fork failed: {e}")),
+        Ok(ForkResult::Child) => child(spec, report.as_mut()),
+        Ok(ForkResult::Parent { child }) => {
+            CHILD.store(child.as_raw(), Ordering::SeqCst);
+            if let Some(r) = report.as_mut() {
+                let _ = writeln!(r, "pid {child}");
+            }
+            drop(report);
+            let handler = SigAction::new(
+                SigHandler::Handler(forward),
+                SaFlags::SA_RESTART,
+                SigSet::empty(),
+            );
+            let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+            // SAFETY: the handler only calls kill.
+            unsafe {
+                let _ = sigaction(Signal::SIGTERM, &handler);
+                let _ = sigaction(Signal::SIGHUP, &handler);
+                let interrupt = if spec.interactive { &ignore } else { &handler };
+                let _ = sigaction(Signal::SIGINT, interrupt);
+                let _ = sigaction(Signal::SIGQUIT, interrupt);
+            }
+            std::process::exit(wait_for(child));
+        }
+    }
+}
+
+fn wait_for(child: Pid) -> i32 {
+    loop {
+        match waitpid(child, None) {
+            Ok(WaitStatus::Exited(_, code)) => return code,
+            Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+            Ok(_) | Err(nix::Error::EINTR) => continue,
+            Err(e) => fail(format!("waitpid failed: {e}")),
+        }
+    }
+}
+
+fn child(spec: &EnterSpec, report: Option<&mut File>) -> ! {
+    if let Some(setup) = &spec.setup
+        && let Err(e) = build_node(setup)
+    {
+        fail(format!("can't set up node `{}`: {e}", setup.hostname));
+    }
+    if spec.setpgid {
+        let _ = nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0));
+    }
+    if let Some(r) = report {
+        let _ = writeln!(r, "ready");
+    }
+    if spec.hold {
+        let mut sink = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut sink);
+        std::process::exit(0);
+    }
+    let Some((program, args)) = spec.cmd.split_first() else {
+        fail("no command given")
+    };
+    let err = Command::new(program)
+        .args(args)
+        .envs(spec.env.iter().cloned())
+        .exec();
+    eprintln!("tpo: can't run `{program}`: {err}");
+    std::process::exit(if err.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    });
+}
+
+fn build_node(setup: &NodeSetup) -> nix::Result<()> {
+    unshare(CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )?;
+    mount(
+        Some("proc"),
+        "/proc",
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )?;
+    for (source, target) in &setup.binds {
+        mount(
+            Some(source.as_path()),
+            target.as_path(),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
+    }
+    nix::unistd::sethostname(&setup.hostname)?;
+    Ok(())
+}

@@ -1,7 +1,7 @@
 //! Planning: faults, the effective edge set, and the operations that realise it.
 
 pub mod direct;
-mod ops;
+pub mod ops;
 
 pub use ops::{Op, Target};
 
@@ -221,6 +221,7 @@ impl EdgeFault {
 /// Runtime faults layered over the spec, per directed edge (spec §7.3).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Faults {
+    #[serde(with = "crate::model::edge_map")]
     pub edges: IndexMap<Edge, EdgeFault>,
 }
 
@@ -388,12 +389,21 @@ pub fn describe_changes(
                 lines.push(one(verb));
             }
         }
-        describe_props(edge, before, after, &mut lines);
+        describe_prop_changes(edge, before, after, &mut lines);
     }
     lines
 }
 
-fn describe_props(
+/// `delay 20ms loss 2%`: every property that is set, for humans.
+pub fn describe_props(props: &LinkProps) -> String {
+    Prop::ALL
+        .iter()
+        .filter_map(|p| p.show(props).map(|v| format!("{} {v}", p.name())))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn describe_prop_changes(
     edge: &Edge,
     before: &IndexMap<Edge, EffEdge>,
     after: &IndexMap<Edge, EffEdge>,
