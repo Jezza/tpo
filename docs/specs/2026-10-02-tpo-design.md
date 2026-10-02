@@ -1,8 +1,7 @@
 # tpo — design
 
 Date: 2026-10-02
-Status: draft for review (rev 5 — second review folded in: permanent neighbours, separate gateway
-netns, handle/MAC layout)
+Status: approved for implementation (rev 6 — third review folded in)
 
 ## 1. Purpose
 
@@ -188,8 +187,9 @@ direction of an earlier bidirectional link.
 - Each node's IPv6 address is `subnet6` + the same host index (`fd77::1` for `10.77.0.1`); an
   explicit `addr6` overrides it.
 - Every node interface tpo creates has a deterministic, locally administered MAC
-  `02:74:<lab hash, 16 bits>:<index, 16 bits>` (routed-mode veths add the peer's index in the hash
-  bytes so each end is unique). Filters key on these MACs (§4.1) and neighbour entries are
+  `02:74:<lab hash, 16 bits>:<own index, 16 bits>`. Routed-mode veths use
+  `02:74:<(lab hash + peer index) mod 2^16>:<own index>`, so the two ends of a pair (and a node's
+  veths to different peers) are distinct. Filters key on these MACs (§4.1) and neighbour entries are
   static (§4).
 - **Allocations are persisted** in `state.json`: on `apply`, existing nodes keep their addresses;
   new nodes get the lowest free one; removed nodes free theirs. An explicit `addr` that differs
@@ -222,7 +222,8 @@ direction of an earlier bidirectional link.
 
 Common to both modes, in every node: `lo` up; IPv6 enabled; `rp_filter=0` set explicitly;
 IPv6 DAD disabled (`accept_dad=0`, addresses are unique by construction) so addresses are usable
-immediately.
+immediately. Every interface tpo creates gets an explicit link-local `fe80::<own index>/64`
+(`addr_gen_mode none`), so link-local addresses never depend on EUI-64.
 
 **Static neighbours.** Because every MAC is known, tpo installs **permanent neighbour entries**
 (`ip neigh replace <addr> lladdr <mac> nud permanent`, for IPv4, IPv6 global and IPv6 link-local)
@@ -285,8 +286,8 @@ ARP/NDP traffic, so `explain`/golden output is deterministic.
 - Routes: to each neighbour `ip route add <nbr>/32 dev <veth>`; to each further node
   `ip route add <dst>/32 via <next-hop> dev <veth> onlink`, along the shortest path over live
   directed edges (`metric`). The source address is the node's `/32` (verified).
-- IPv6 likewise: each node's `/128` on `lo`; each veth gets an explicit link-local
-  `fe80::<own index>/64`; routes are `ip -6 route add <dst>/128 via fe80::<next-hop index> dev
+- IPv6 likewise: each node's `/128` on `lo`; veths carry only their `fe80::<own index>/64` (§4);
+  routes are `ip -6 route add <dst>/128 via fe80::<next-hop index> dev
   <veth>`.
 - **`internet` is never a transit hop** in path computation (the gateway drops lab→lab traffic).
 - netem on each veth's egress, per direction (same class-per-edge rules as §4.1, one peer per
@@ -328,8 +329,8 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
     each `internet` edge), and a src-MAC ingress allowlist of nodes with a live edge to
     `internet`. The nft sets below are then defence in depth.
   - In routed mode it is the `internet` router node, with veths to linked nodes.
-  - Its nft `input` chain drops everything from the lab except established traffic, so a node
-    without an `internet` edge can't even ping the gateway.
+  - Its nft `input` chain accepts lab traffic only from `allowed4`/`allowed6` and drops the
+    rest, so a node without an `internet` edge can't even ping the gateway.
   - Like nodes, its netns is held by a long-lived holder process inside the lab pid namespace
     (§7.1), so the netns has a `/proc` path that disappears with the lab.
 - **pasta** (from `passt`, rootless Podman's default) copies the host's real addresses and routes
@@ -374,12 +375,30 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - Rootless ICMP to the internet requires the host's `net.ipv4.ping_group_range` to allow it;
   TCP/UDP always work.
 - pasta and `/dev/net/tun` are runtime dependencies only for rootless labs using `internet`.
-- **Root mode does not use pasta.** The gateway gets a veth pair into the host netns
-  (`tpo-<lab>-up`), the host side gets addresses from a per-lab transit range, and the host does
-  NAT in the kernel: an `nft` table `tpo-<lab>` with `inet` masquerade out of the host's default
-  route interfaces, plus `net.ipv4.ip_forward` / `net.ipv6.conf.all.forwarding` enabled. `down`
-  (and `down --force`) remove the veth and the nft table. DNS forward addresses are DNATed to the
-  host's resolvers by that table; `host_loopback` maps to the host-side veth address.
+- **Root mode does not use pasta** (kernel NAT; *open question below*):
+  - The gateway gets a veth pair into the host netns (`tpo-<lab>-up`), unnumbered on the host
+    side: the host gets `ip route add <subnet> via <gateway .254> dev tpo-<lab>-up onlink` (and
+    the IPv6 equivalent via the gateway's `fe80::<idx>`), plus a static neighbour for the gateway.
+  - The host does NAT in an `nft` table `tpo-<lab>`:
+    `ip saddr <subnet> oifname != "tpo-<lab>-up" masquerade` (and `ip6 saddr <subnet6>`), so it
+    keeps working when the host's uplink changes (Wi-Fi, VPN).
+  - DNS: `192.0.2.53` is DNATed to the host's resolver; a loopback resolver (`127.0.0.1`,
+    `127.0.0.53`) requires `route_localnet=1` on `tpo-<lab>-up`. IPv6 has no `route_localnet`, so
+    the IPv6 DNS address is omitted when the host's resolvers are loopback-only.
+    `host_loopback`: DNAT `192.0.2.2 → 127.0.0.1` (same `route_localnet`), so 127.0.0.1-bound
+    host services are reachable as with pasta; IPv6 `host` maps only to non-loopback listeners.
+  - Forwarding: `net.ipv4.ip_forward=1`; for IPv6, `accept_ra=2` is set on the host's
+    RA-configured interfaces *before* enabling forwarding so the host keeps its SLAAC default
+    route. Previous sysctl values are recorded in `state.json` and restored on `down` /
+    `down --force`.
+  - Host firewalls: a `drop` in any forward-hook chain (Docker's `FORWARD DROP`, ufw, firewalld)
+    overrides tpo's accept; `doctor` detects this and prints the exact fix.
+  - `down` (and `down --force`) remove the veth, routes, nft table and restore sysctls.
+- **Open question (raised by review): pasta in root mode too.** pasta runs fine as root and would
+  remove every host-side change above (sysctls, routes, nft, crash leftovers), at the cost of
+  kernel-NAT throughput and ICMP. Alternative: pasta default in root mode, kernel NAT opt-in
+  (`--kernel-nat`). To be decided before the root-mode uplink is implemented (it is the last
+  milestone).
 - **Decision — run pasta as a binary, don't link a library.** This is how rootless Podman
   (`containers/common`) and rootlesskit use pasta/slirp4netns. passt has no library API and is
   GPL-2.0-or-later. The linkable alternatives were rejected: libslirp (slower, weak IPv6),
@@ -400,8 +419,10 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   1. `clone(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID)` the **lab init** (`tpo __init`), which
      is pid 1 of the lab pid namespace; write its uid/gid maps.
   2. The init sets `PR_SET_PDEATHSIG(SIGKILL)` (its parent thread is the supervisor's permanent
-     main thread), then checks `getppid()` to close the clone→prctl race (exits if the supervisor
-     is already gone), then just reaps zombies. When it dies, the kernel SIGKILLs every process in
+     main thread). To close the clone→prctl race it then `poll()`s a pipe whose write end the
+     supervisor holds: `POLLHUP` means the supervisor is gone, so it exits. (`getppid()` can't be
+     used: pid 1 of a new pid namespace always sees parent pid 0 — verified.) The same pipe
+     carries the "uid/gid maps written" go-ahead. After that it just reaps zombies. When it dies, the kernel SIGKILLs every process in
      the lab pid namespace.
   3. The supervisor opens fds on the init's `ns/{user,net,pid}`; the init's netns is the **hub**
      (the bridge only). The gateway has its own netns (§6).
@@ -413,7 +434,9 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   - pasta: spawned without any `setns`; it joins the gateway netns itself (§6).
   - Node setup: a child joins the lab user + pid namespaces via `tpo __enter`, unshares
     net + mnt + uts, sets up mounts/hostname/sysctls, and stays as a tiny holder until the
-    supervisor has opened fds on its `ns/{net,mnt,uts}`, then exits. The gateway's holder is the
+    supervisor has opened fds on its `ns/{net,mnt,uts}`, then exits. The process that unshares is
+    the `__enter` grandchild (after `setns(pid)` + fork), so the wrapper reports that child's
+    host-visible pid to the supervisor over a pipe. The gateway's holder is the
     exception: it stays alive for the lab's lifetime (pasta needs a `/proc` path, §6). Verified:
     a holder joining user+pid from the host, then unsharing net+mnt+uts, remounting `/proc` and
     setting the hostname works, and `kill -9` of init kills it.
@@ -427,7 +450,8 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   kernel; pasta exits when its netns disappears. Nothing is left behind rootless.
 - Root mode: same structure without the user namespace; nodes' netns are additionally bind-mounted
   under `/run/netns/tpo-<lab>-<node>` by the supervisor itself (it is still in the host mount
-  namespace, so the bind mounts are visible to the host).
+  namespace), via `ip netns attach <name> <holder pid>` while the holder is alive, so iproute2's
+  shared `/run/netns` mount conventions are followed.
 
 ### 7.2 Protocol and the CLI
 
@@ -441,7 +465,8 @@ One crate (`tpo`, lib + bin). The supervisor is the same binary.
   1. `setns` user → mnt → net → uts → pid, before anything could spawn a thread
   2. `chdir` back to the original cwd (`setns(mnt)` resets it to `/`; falls back to `/`)
   3. fork (the pid namespace applies to children) and exec the command in the child with the
-     `TPO_*` environment; the parent forwards SIGTERM/SIGINT/SIGHUP to the child, waits,
+     `TPO_*` environment; the parent forwards SIGTERM/SIGHUP to the child (and ignores SIGINT/SIGQUIT,
+     which the tty already delivers to the child's foreground process group), waits,
      and exits with the child's status (128 + n if it died from signal n).
 
   tty, stdio and signals are inherited normally.
