@@ -457,6 +457,7 @@ pub fn describe_changes(
 
     let mut lines = Vec::new();
     let mut reported = IndexSet::new();
+    let mut props_reported = IndexSet::new();
     let removed = before.keys().filter(|e| !after.contains_key(*e));
     for edge in after.keys().chain(removed) {
         let rev = edge.reversed();
@@ -470,7 +471,7 @@ pub fn describe_changes(
                 continue;
             }
             if presence(&rev) == (was, is) {
-                reported.insert(rev);
+                reported.insert(rev.clone());
                 lines.push(both(verb));
             } else {
                 lines.push(one(verb));
@@ -483,13 +484,26 @@ pub fn describe_changes(
         {
             let verb = if up { "heal" } else { "cut" };
             if up_change(&rev) == Some(up) {
-                reported.insert(rev);
+                reported.insert(rev.clone());
                 lines.push(both(verb));
             } else {
                 lines.push(one(verb));
             }
         }
-        describe_prop_changes(edge, before, after, &mut lines);
+        if props_reported.contains(edge) {
+            continue;
+        }
+        let changes = prop_changes(edge, before, after);
+        if !changes.is_empty() && prop_changes(&rev, before, after) == changes {
+            props_reported.insert(rev.clone());
+            lines.extend(
+                changes
+                    .iter()
+                    .map(|c| format!("{}⇄{} {c}", edge.from, edge.to)),
+            );
+        } else {
+            lines.extend(changes.iter().map(|c| format!("{edge} {c}")));
+        }
     }
     lines
 }
@@ -503,27 +517,23 @@ pub fn describe_props(props: &LinkProps) -> String {
         .join(" ")
 }
 
-fn describe_prop_changes(
+/// `delay 10ms→200ms`-style changes of one edge's properties.
+fn prop_changes(
     edge: &Edge,
     before: &IndexMap<Edge, EffEdge>,
     after: &IndexMap<Edge, EffEdge>,
-    lines: &mut Vec<String>,
-) {
+) -> Vec<String> {
     let (Some(b), Some(a)) = (before.get(edge), after.get(edge)) else {
-        return;
+        return Vec::new();
     };
-    for prop in Prop::ALL {
-        let (old, new) = (prop.show(&b.props), prop.show(&a.props));
-        if old != new {
-            let show = |v: Option<String>| v.unwrap_or_else(|| "none".to_owned());
-            lines.push(format!(
-                "{edge} {} {}→{}",
-                prop.name(),
-                show(old),
-                show(new)
-            ));
-        }
-    }
+    let show = |v: Option<String>| v.unwrap_or_else(|| "none".to_owned());
+    Prop::ALL
+        .iter()
+        .filter_map(|prop| {
+            let (old, new) = (prop.show(&b.props), prop.show(&a.props));
+            (old != new).then(|| format!("{} {}→{}", prop.name(), show(old), show(new)))
+        })
+        .collect()
 }
 
 #[cfg(test)]

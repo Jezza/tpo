@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib --test examples
+
+  integration:
+    # Real labs: needs unprivileged user namespaces, tc modules and pasta.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y iproute2 nftables passt
+      # Ubuntu ≥ 23.10 restricts unprivileged user namespaces with AppArmor.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # Module autoload from a user namespace isn't guaranteed on every kernel.
+      - run: sudo modprobe -a sch_netem sch_htb sch_ingress cls_flower cls_matchall act_gact || true
+      - run: cargo run -- doctor
+      - run: cargo test --tests

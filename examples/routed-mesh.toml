@@ -1,0 +1,19 @@
+# Routers: packets cross intermediate nodes, delays add up, cuts fail over.
+name = "mesh"
+mode = "routed"
+metric = "delay"
+
+[nodes]
+a = {}
+b = {}
+c = {}
+d = {}
+
+[[link]]
+path = ["a", "b", "c", "d"]
+delay = "5ms"
+
+[[link]]
+from = "a"
+to = "d"
+delay = "40ms"

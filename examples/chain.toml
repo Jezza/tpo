@@ -1,0 +1,13 @@
+# Three nodes in a line. In direct mode a and c can't see each other at all;
+# anything that wants to get from a to c has to be relayed by b.
+name = "chain"
+
+[nodes]
+a = {}
+b = {}
+c = {}
+
+[[link]]
+path = ["a", "b", "c"]
+delay = "20ms"
+jitter = "2ms"

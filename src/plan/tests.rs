@@ -264,3 +264,20 @@ fn describes_changes_between_effective_states() {
     let lines = describe_changes(&before, &after);
     assert_eq!(lines, ["cut a⇄b", "b→c delay 10ms→200ms"]);
 }
+
+#[test]
+fn property_changes_on_both_directions_are_reported_once() {
+    let t = lab();
+    let before = effective(&t, &Faults::default(), 0);
+    let mut f = Faults::default();
+    let both = edges_between(&t, &["b", "c"], false).unwrap();
+    f.set(
+        &t,
+        &both,
+        &parse_assignments(&["delay=200ms", "loss=5%"]).unwrap(),
+        Until::FOREVER,
+    )
+    .unwrap();
+    let lines = describe_changes(&before, &effective(&t, &f, 0));
+    assert_eq!(lines, ["b⇄c delay 10ms→200ms", "b⇄c loss none→5%"]);
+}

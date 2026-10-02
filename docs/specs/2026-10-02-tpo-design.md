@@ -1,7 +1,7 @@
 # tpo — design
 
 Date: 2026-10-02
-Status: approved for implementation (rev 6 — third review folded in)
+Status: implemented (rev 7 — §11 records where the implementation departs from rev 6)
 
 ## 1. Purpose
 
@@ -607,3 +607,29 @@ Licence: MIT OR Apache-2.0.
    Skips with a stated reason when `doctor` fails.
 4. **CI**: GitHub Actions `ubuntu-latest`, relaxing the AppArmor userns sysctl via `sudo`, plus a
    job running integration tests under `--root`.
+
+## 11. Implementation notes (2026-10-02)
+
+Where the v1 implementation departs from or pins down the design above:
+
+- **No spawner thread, no async runtime.** Only the lab init carries `PR_SET_PDEATHSIG`, and
+  it is cloned from the supervisor's main thread, which lives as long as the lab; every other
+  lab process dies with the pid namespace. So the supervisor uses plain threads (one per
+  connection, a signal thread, a fault-timer thread) and forks from any of them.
+- **Holders.** Node holders exit once the supervisor holds their namespace fds. Only the
+  gateway's holder stays alive (pasta needs `/proc/<pid>/ns/net`).
+- **Peer namespaces for `ip`.** Routed-mode veth pairs name the peer's netns with an inherited
+  fd: planned operations say `netns @netns:<node>`, and the backend replaces that with
+  `/proc/self/fd/<n>` for an fd it inherits into `ip` (verified: iproute2 accepts paths).
+- **`ip -batch`** does not take per-line options, so planned operations never use `-6`: the
+  address family comes from the addresses (`neigh replace <v6>`, `route replace ::/0`).
+- **Removed endpoints** get an explicit `ip link del` of their bridge port (direct) or veth
+  (routed) before anything else in the same diff: namespace teardown is asynchronous, and a
+  new node may reuse the index, and so the interface name, in the same `apply`.
+- **`apply`** can't change `mode` or an existing node's address; both need a restart.
+- **`host_loopback`** maps IPv4 only (`192.0.2.2`, resolvable as `host`).
+- **Supervisor log** is `$XDG_RUNTIME_DIR/tpo/<lab>.log`, outside the lab dir, so it survives
+  teardown. `up` refuses runtime dirs whose control-socket path exceeds `sun_path`.
+- **Not implemented yet:** root mode (`--root`, `down --force`) — pending the open question in
+  §6 about using pasta there too.
+

@@ -1,0 +1,28 @@
+# Edge nodes that can only reach each other through something on the internet
+# (a lighthouse, a relay), with a slow, lossy uplink for one of them.
+name = "star"
+
+[nodes]
+hq = {}
+edge1 = {}
+edge2 = {}
+
+[groups]
+edge = ["edge1", "edge2"]
+
+[[link]]
+from = ["hq", "edge"]
+to = "internet"
+delay = "15ms"
+
+[[link]]
+from = "edge2"
+to = "internet"
+delay = "120ms"
+loss = "2%"
+
+[internet]
+host_loopback = true   # services on this machine's 127.0.0.1 are reachable as `host`
+
+[run]
+"*" = "echo $TPO_NODE is up at $TPO_ADDR / $TPO_ADDR6; sleep infinity"
