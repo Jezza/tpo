@@ -44,9 +44,19 @@ enum Cmd {
         /// Detach and return once the lab is up.
         #[arg(short, long)]
         detach: bool,
+        /// Run as root without a user namespace; nodes appear in `ip netns`.
+        #[arg(long)]
+        root: bool,
+        /// With --root: NAT internet traffic in the host kernel instead of pasta.
+        #[arg(long, requires = "root")]
+        kernel_nat: bool,
     },
     /// Stop a lab.
-    Down,
+    Down {
+        /// Clean up after a root-mode lab whose supervisor died.
+        #[arg(long)]
+        force: bool,
+    },
     /// Replace the running lab's topology with a new file.
     Apply { file: PathBuf },
     /// Cut every link between different sides (one side: that side against everyone else).
@@ -116,6 +126,10 @@ enum Cmd {
         file: PathBuf,
         #[arg(long)]
         ready_fd: Option<i32>,
+        #[arg(long)]
+        root: bool,
+        #[arg(long)]
+        kernel_nat: bool,
     },
     #[command(hide = true, name = "__init")]
     Init { fd: i32 },
@@ -147,18 +161,36 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 serde_json::from_str(&spec).map_err(|e| format!("bad spec: {e}"))?;
             enter(&spec)
         }
-        Cmd::Supervise { file, ready_fd } => {
-            tpo::supervisor::run(tpo::supervisor::Options { file, ready_fd })
-        }
+        Cmd::Supervise {
+            file,
+            ready_fd,
+            root,
+            kernel_nat,
+        } => tpo::supervisor::run(tpo::supervisor::Options {
+            file,
+            ready_fd,
+            root,
+            kernel_nat,
+        }),
         Cmd::Up {
             file,
             detach: false,
+            root,
+            kernel_nat,
         } => tpo::supervisor::run(tpo::supervisor::Options {
             file,
             ready_fd: None,
+            root,
+            kernel_nat,
         }),
-        Cmd::Up { file, detach: true } => return up_detached(&file),
-        Cmd::Down => return down(cli.lab.as_deref()),
+        Cmd::Up {
+            file,
+            detach: true,
+            root,
+            kernel_nat,
+        } => return up_detached(&file, root, kernel_nat),
+        Cmd::Down { force: false } => return down(cli.lab.as_deref()),
+        Cmd::Down { force: true } => return down_force(cli.lab.as_deref()),
         Cmd::Doctor => return Ok(doctor(cli.json)),
         Cmd::Exec { node, cmd } => exec(&client()?, &node, cmd),
         Cmd::Shell { node } => {
@@ -250,7 +282,7 @@ fn print_changes(response: &Response) {
     }
 }
 
-fn up_detached(file: &PathBuf) -> Result<ExitCode, String> {
+fn up_detached(file: &PathBuf, root: bool, kernel_nat: bool) -> Result<ExitCode, String> {
     let source =
         std::fs::read_to_string(file).map_err(|e| format!("can't read {}: {e}", file.display()))?;
     let stem = file
@@ -269,6 +301,8 @@ fn up_detached(file: &PathBuf) -> Result<ExitCode, String> {
         .arg(file)
         .arg("--ready-fd")
         .arg(write_fd.to_string())
+        .args(root.then_some("--root"))
+        .args(kernel_nat.then_some("--kernel-nat"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -299,6 +333,40 @@ fn up_detached(file: &PathBuf) -> Result<ExitCode, String> {
     }
 }
 
+/// Cleans up after a root-mode lab whose supervisor is gone (or stops it, if it's alive).
+fn down_force(lab: Option<&str>) -> Result<ExitCode, String> {
+    if !nix::unistd::geteuid().is_root() {
+        return Err("`down --force` needs root: run `sudo tpo down --force`".to_owned());
+    }
+    let dir = match lab {
+        Some(name) => LabDir::new(name),
+        None => {
+            let stale = labdir::stale();
+            match stale.as_slice() {
+                [one] => one.clone(),
+                [] => return down(None),
+                many => {
+                    let names: Vec<_> = many.iter().map(|l| l.name.as_str()).collect();
+                    return Err(format!(
+                        "several labs have leftovers ({}); pick one with --lab",
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+    };
+    if dir.live_pid().is_some() {
+        return down(Some(&dir.name));
+    }
+    if !dir.exists() {
+        return Err(format!("lab `{}` has nothing to clean up", dir.name));
+    }
+    for line in tpo::supervisor::force_down(&dir)? {
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn down(lab: Option<&str>) -> Result<ExitCode, String> {
     let client = Client::connect(lab)?;
     let pid = client.lab.live_pid();
@@ -325,19 +393,28 @@ fn exec(client: &Client, node: &str, cmd: Vec<String>) -> ! {
             std::process::exit(1);
         }
     };
-    if fds.len() != 5 {
-        eprintln!("tpo: the lab sent {} namespace fds, expected 5", fds.len());
+    let names: Vec<String> =
+        serde_json::from_value(response.data["fds"].clone()).unwrap_or_default();
+    if names.len() != fds.len() {
+        eprintln!(
+            "tpo: the lab sent {} namespace fds for {} names",
+            fds.len(),
+            names.len()
+        );
         std::process::exit(1);
     }
-    let raw: Vec<i32> = fds.into_iter().map(IntoRawFd::into_raw_fd).collect();
+    let fds: std::collections::HashMap<String, i32> = names
+        .into_iter()
+        .zip(fds.into_iter().map(IntoRawFd::into_raw_fd))
+        .collect();
     let env: Vec<(String, String)> =
         serde_json::from_value(response.data["env"].clone()).unwrap_or_default();
     let spec = EnterSpec {
-        user: Some(raw[0]),
-        mnt: Some(raw[1]),
-        net: Some(raw[2]),
-        uts: Some(raw[3]),
-        pid: Some(raw[4]),
+        user: fds.get("user").copied(),
+        mnt: fds.get("mnt").copied(),
+        net: fds.get("net").copied(),
+        uts: fds.get("uts").copied(),
+        pid: fds.get("pid").copied(),
         interactive: nix::unistd::isatty(std::io::stdin()).unwrap_or(false),
         env,
         cmd,

@@ -3,10 +3,13 @@
 
 mod files;
 mod handlers;
+mod host;
+mod kernel_nat;
 mod procs;
 mod server;
 mod uplink;
 
+pub use host::force_down;
 pub use uplink::host_families;
 
 use crate::addr::{Addresses, allocate};
@@ -33,6 +36,10 @@ pub struct Options {
     pub file: PathBuf,
     /// Where to report `ok` or `error: …` once the lab is up (for `tpo up -d`).
     pub ready_fd: Option<RawFd>,
+    /// Root mode: no user namespace, nodes visible in `/run/netns` (spec §2).
+    pub root: bool,
+    /// With `root`: the kernel does the internet NAT instead of pasta (spec §6).
+    pub kernel_nat: bool,
 }
 
 /// A node's (or the gateway's) namespaces.
@@ -44,6 +51,8 @@ pub struct NodeNs {
     pub holder: Option<Child>,
     /// The holder's host pid, while it is alive.
     pub holder_pid: Option<i32>,
+    /// Root mode: the `/run/netns` name.
+    pub netns_name: Option<String>,
 }
 
 /// Everything the supervisor knows, behind one lock.
@@ -67,6 +76,10 @@ pub struct Lab {
     pub pasta_pid: Option<i32>,
     /// Nodes currently in the gateway's nft sets.
     pub allowed: uplink::Allowed,
+    /// Root mode: what this lab changed on the host.
+    pub host: host::HostState,
+    /// Use `--kernel-nat` when the lab uses `internet`.
+    pub kernel_nat: bool,
 }
 
 pub type Shared = Arc<Mutex<Lab>>;
@@ -136,9 +149,21 @@ fn start(opts: &Options) -> Result<Shared, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let file = std::fs::canonicalize(&opts.file).unwrap_or_else(|_| opts.file.clone());
 
+    if opts.root && !nix::unistd::geteuid().is_root() {
+        return Err("`--root` needs root: run `sudo tpo up --root …`".to_owned());
+    }
+    if opts.kernel_nat && !opts.root {
+        return Err("`--kernel-nat` only works with `--root`".to_owned());
+    }
     let dir = LabDir::new(&topo.name);
     if dir.live_pid().is_some() {
         return Err(format!("lab `{}` is already running", topo.name));
+    }
+    if dir.exists() && host::load(&dir).is_some_and(|h| h.root) {
+        return Err(format!(
+            "lab `{}` has leftovers from a supervisor that died; clean them up with `sudo tpo down --force --lab {}`",
+            topo.name, topo.name
+        ));
     }
     // sun_path is 108 bytes including the terminating NUL.
     if dir.ctl().as_os_str().len() > 107 {
@@ -155,12 +180,9 @@ fn start(opts: &Options) -> Result<Shared, String> {
     redirect_stderr(&dir.supervisor_log(), opts.ready_fd.is_some());
 
     // Still single-threaded: clone the lab init before anything starts a thread.
-    let init =
-        ns::spawn_init(&exe, true).map_err(|e| format!("can't create the lab namespaces: {e}"))?;
+    let init = ns::spawn_init(&exe, !opts.root)
+        .map_err(|e| format!("can't create the lab namespaces: {e}"))?;
     block_shutdown_signals();
-
-    files::write_etc(&dir, &topo, &addrs)
-        .map_err(|e| format!("can't write the lab's /etc files: {e}"))?;
 
     let topo_mode = topo.mode;
     let lab = Lab {
@@ -180,7 +202,14 @@ fn start(opts: &Options) -> Result<Shared, String> {
         shutting_down: false,
         pasta_pid: None,
         allowed: uplink::Allowed::new(),
+        host: host::HostState {
+            root: opts.root,
+            ..Default::default()
+        },
+        kernel_nat: opts.kernel_nat,
     };
+    files::write_etc(&lab.dir, &lab.topo, &lab.addrs, &lab.resolv_conf())
+        .map_err(|e| format!("can't write the lab's /etc files: {e}"))?;
     let shared = Arc::new(Mutex::new(lab));
     {
         let mut lab = shared.lock().unwrap();
@@ -235,7 +264,9 @@ fn build(lab: &mut Lab) -> Result<(), String> {
     for (target, hostname) in endpoints {
         let keep = target == Target::Gateway;
         let ns = spawn_holder(lab, &hostname, keep)?;
+        lab.host.netns.extend(ns.netns_name.clone());
         lab.nodes.insert(target, ns);
+        lab.save();
     }
     lab.eff = effective(&lab.topo, &lab.faults, now_ms());
     let ctx = Ctx::new(&lab.topo, &lab.addrs);
@@ -263,7 +294,7 @@ pub(super) fn spawn_holder(lab: &Lab, hostname: &str, keep: bool) -> Result<Node
         ));
     }
     let spec = EnterSpec {
-        user: Some(lab.init.user.as_raw_fd()),
+        user: lab.init.user.as_ref().map(AsRawFd::as_raw_fd),
         pid: Some(lab.init.pid_ns.as_raw_fd()),
         setup: Some(NodeSetup {
             hostname: hostname.to_owned(),
@@ -278,12 +309,20 @@ pub(super) fn spawn_holder(lab: &Lab, hostname: &str, keep: bool) -> Result<Node
         ns::open_ns(host_pid, kind)
             .map_err(|e| format!("can't open `{hostname}`'s {kind} namespace: {e}"))
     };
+    let netns_name = if lab.host.root {
+        let name = host::netns_name(&lab.topo.name, hostname);
+        host::attach_netns(&name, host_pid)?;
+        Some(name)
+    } else {
+        None
+    };
     let node = NodeNs {
         net: open("net")?,
         mnt: open("mnt")?,
         uts: open("uts")?,
         holder: None,
         holder_pid: None,
+        netns_name,
     };
     if keep {
         Ok(NodeNs {
@@ -307,6 +346,7 @@ struct SavedState<'a> {
     addresses: &'a Addresses,
     faults: &'a Faults,
     pasta_pid: Option<i32>,
+    host: &'a host::HostState,
 }
 
 impl Lab {
@@ -320,7 +360,11 @@ impl Lab {
             nets.insert(t.clone(), n.net.try_clone().expect("dup netns fd"));
         }
         NetFds {
-            user: Some(self.init.user.try_clone().expect("dup userns fd")),
+            user: self
+                .init
+                .user
+                .as_ref()
+                .map(|u| u.try_clone().expect("dup userns fd")),
             hub_pid: self.init.pid.as_raw(),
             nets,
         }
@@ -353,6 +397,7 @@ impl Lab {
             addresses: &self.addrs,
             faults: &self.faults,
             pasta_pid: self.pasta_pid,
+            host: &self.host,
         };
         let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
         let tmp = self.dir.state().with_extension("json.tmp");
@@ -371,10 +416,47 @@ impl Lab {
                 let _ = h.wait();
             }
         }
+        for name in std::mem::take(&mut self.host.netns) {
+            host::delete_netns(&name);
+        }
         let _ = self.dir.remove();
     }
 
-    /// Installs the gateway's nft ruleset and starts pasta (spec §6).
+    /// Deletes a removed endpoint's `/run/netns` entry (root mode).
+    pub fn forget_netns(&mut self, name: Option<&str>) {
+        if let Some(name) = name {
+            host::delete_netns(name);
+            self.host.netns.retain(|n| n != name);
+        }
+    }
+
+    /// The lab's `/etc/resolv.conf`: the DNS-forward addresses the uplink can serve.
+    pub fn resolv_conf(&self) -> String {
+        if !self.topo.uses_internet() {
+            return String::new();
+        }
+        if !self.kernel_nat {
+            return uplink::resolv_conf();
+        }
+        let k = kernel_nat::KernelNat::new(crate::addr::lab_hash(&self.topo.name));
+        let (dns4, dns6) =
+            kernel_nat::resolvers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+        let mut out = String::new();
+        if dns4.is_some() {
+            out.push_str(&format!("nameserver {}\n", uplink::DNS4));
+        }
+        if k.forwards_dns6(dns6) {
+            out.push_str(&format!("nameserver {}\n", uplink::DNS6));
+        }
+        out
+    }
+
+    /// Whether the internet uplink is up (pasta or kernel NAT).
+    pub fn uplink_active(&self) -> bool {
+        self.pasta_pid.is_some() || self.host.kernel_nat.is_some()
+    }
+
+    /// Installs the gateway's nft ruleset and starts the uplink (spec §6).
     pub fn start_uplink(&mut self) -> Result<(), String> {
         let holder = self
             .nodes
@@ -382,10 +464,35 @@ impl Lab {
             .and_then(|g| g.holder_pid)
             .ok_or("the gateway namespace is missing")?;
         let allowed = self.desired.internet_allowed();
-        let ruleset = crate::plan::Op::nft(&Target::Gateway, uplink::ruleset(&allowed));
-        backend::run(&self.netfds(), &self.tools, &[ruleset])?;
+        if !self.kernel_nat {
+            let ruleset = crate::plan::Op::nft(&Target::Gateway, uplink::ruleset(&allowed));
+            backend::run(&self.netfds(), &self.tools, &[ruleset])?;
+            self.allowed = allowed;
+            self.pasta_pid = Some(uplink::start_pasta(self, holder)?);
+            return Ok(());
+        }
+
+        let k = kernel_nat::KernelNat::new(crate::addr::lab_hash(&self.topo.name));
+        let (dns4, dns6) =
+            kernel_nat::resolvers(&std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default());
+        let route_localnet =
+            dns4.is_some_and(|d| d.is_loopback()) || self.topo.internet.host_loopback;
+        let mut ops = vec![crate::plan::Op::nft(
+            &Target::Gateway,
+            uplink::gateway_ruleset(&allowed, kernel_nat::GW_IF, false),
+        )];
+        ops.extend(k.setup_ops(&self.topo, &self.addrs, route_localnet));
+        ops.push(crate::plan::Op::nft(
+            &Target::Host,
+            k.host_ruleset(&self.topo, dns4, dns6),
+        ));
+        // Record before applying, so a crash part-way through can still be cleaned up.
+        self.host.kernel_nat = Some(k);
+        self.save();
+        backend::run(&self.netfds(), &self.tools, &ops)?;
+        self.host.sysctls = host::Sysctls::host().enable_forwarding()?;
         self.allowed = allowed;
-        self.pasta_pid = Some(uplink::start_pasta(self, holder)?);
+        self.save();
         Ok(())
     }
 
@@ -395,6 +502,16 @@ impl Lab {
                 nix::unistd::Pid::from_raw(pid),
                 nix::sys::signal::Signal::SIGTERM,
             );
+        }
+        if let Some(k) = self.host.kernel_nat.take() {
+            for op in k.teardown_ops() {
+                if let Err(e) = backend::run(&self.netfds(), &self.tools, &[op]) {
+                    eprintln!("tpo: {e}");
+                }
+            }
+            if !host::other_kernel_nat_lab(&self.topo.name) {
+                host::Sysctls::host().restore(&std::mem::take(&mut self.host.sysctls));
+            }
         }
         self.allowed.clear();
     }

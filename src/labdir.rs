@@ -5,10 +5,35 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub fn runtime_root() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("tpo-{}", nix::unistd::getuid())));
-    base.join("tpo")
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => PathBuf::from(dir).join("tpo"),
+        // `sudo` usually drops XDG_RUNTIME_DIR; root labs live in /run/tpo.
+        None if nix::unistd::geteuid().is_root() => PathBuf::from("/run/tpo"),
+        None => std::env::temp_dir()
+            .join(format!("tpo-{}", nix::unistd::getuid()))
+            .join("tpo"),
+    }
+}
+
+/// Whether a dead lab's dir records root-mode host state that `down --force` must undo.
+fn has_root_leftovers(lab: &LabDir) -> bool {
+    std::fs::read_to_string(lab.state())
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .is_some_and(|v| v["host"]["root"] == serde_json::Value::Bool(true))
+}
+
+/// Dead root-mode labs whose leftovers need `tpo down --force`.
+pub fn stale() -> Vec<LabDir> {
+    let Ok(entries) = fs::read_dir(runtime_root()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| LabDir::new(&e.file_name().to_string_lossy()))
+        .filter(|lab| lab.live_pid().is_none() && has_root_leftovers(lab))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +111,10 @@ pub fn running() -> Vec<LabDir> {
             if lab.live_pid().is_some() {
                 true
             } else {
-                let _ = lab.remove();
+                // Root-mode leftovers wait for `tpo down --force`.
+                if !has_root_leftovers(lab) {
+                    let _ = lab.remove();
+                }
                 false
             }
         })

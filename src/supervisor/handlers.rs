@@ -127,7 +127,7 @@ impl Lab {
         let desired = Net::plan(&Ctx::new(&self.topo, &self.addrs), &eff, &self.desired);
         let mut ops = self.desired.diff(&desired);
         let allowed = desired.internet_allowed();
-        if self.pasta_pid.is_some() {
+        if self.uplink_active() {
             ops.extend(super::uplink::update_ops(&self.allowed, &allowed));
         }
         match backend::run(&self.netfds(), &self.tools, &ops) {
@@ -135,7 +135,7 @@ impl Lab {
                 let changes = describe_changes(&self.eff, &eff);
                 self.eff = eff;
                 self.desired = desired;
-                if self.pasta_pid.is_some() {
+                if self.uplink_active() {
                     self.allowed = allowed;
                 }
                 Ok(changes)
@@ -359,7 +359,9 @@ fn apply(shared: &Shared, path: &str, source: &str) -> Outcome {
 
         for node in &removed {
             lab.procs.shift_remove(node);
-            lab.nodes.shift_remove(&Target::node(node));
+            if let Some(ns) = lab.nodes.shift_remove(&Target::node(node)) {
+                lab.forget_netns(ns.netns_name.as_deref());
+            }
         }
         let had_internet = lab.topo.uses_internet();
         if had_internet && !next.uses_internet() {
@@ -368,10 +370,12 @@ fn apply(shared: &Shared, path: &str, source: &str) -> Outcome {
         if had_internet
             && !next.uses_internet()
             && let Some(mut gw) = lab.nodes.shift_remove(&Target::Gateway)
-            && let Some(mut holder) = gw.holder.take()
         {
-            let _ = holder.kill();
-            let _ = holder.wait();
+            lab.forget_netns(gw.netns_name.as_deref());
+            if let Some(mut holder) = gw.holder.take() {
+                let _ = holder.kill();
+                let _ = holder.wait();
+            }
         }
 
         let old_eff = lab.eff.clone();
@@ -379,13 +383,16 @@ fn apply(shared: &Shared, path: &str, source: &str) -> Outcome {
         lab.addrs = addrs;
         let lab = &mut *lab;
         lab.faults.retain_edges(&lab.topo);
-        super::files::write_etc(&lab.dir, &lab.topo, &lab.addrs).map_err(|e| e.to_string())?;
+        super::files::write_etc(&lab.dir, &lab.topo, &lab.addrs, &lab.resolv_conf())
+            .map_err(|e| e.to_string())?;
         for node in &added {
             let ns = super::spawn_holder(lab, node, false)?;
+            lab.host.netns.extend(ns.netns_name.clone());
             lab.nodes.insert(Target::node(node), ns);
         }
         if !had_internet && lab.topo.uses_internet() {
             let ns = super::spawn_holder(lab, "gateway", true)?;
+            lab.host.netns.extend(ns.netns_name.clone());
             lab.nodes.insert(Target::Gateway, ns);
         }
         let mut changes: Vec<String> = removed.iter().map(|n| format!("remove node {n}")).collect();

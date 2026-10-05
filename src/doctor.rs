@@ -101,6 +101,24 @@ pub fn hint_for(error: &str) -> Option<String> {
     })
 }
 
+/// Forward-hook chains with `policy drop` in an `nft list ruleset` (they'd override the accept
+/// rules of a `--kernel-nat` lab), as `family table chain`.
+pub fn forward_drops(ruleset: &str) -> Vec<String> {
+    let mut table = String::new();
+    let mut chain = String::new();
+    let mut out = Vec::new();
+    for line in ruleset.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("table ") {
+            table = rest.trim_end_matches('{').trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("chain ") {
+            chain = rest.trim_end_matches('{').trim().to_owned();
+        } else if line.contains("hook forward") && line.contains("policy drop") {
+            out.push(format!("{table} {chain}"));
+        }
+    }
+    out
+}
+
 pub struct Check {
     pub name: String,
     pub result: Result<String, String>,
@@ -159,6 +177,14 @@ pub fn run() -> Vec<Check> {
         },
     ));
 
+    if nix::unistd::geteuid().is_root() {
+        checks.push(Check::new(
+            "host forwarding (for --kernel-nat)",
+            false,
+            kernel_nat_forwarding(),
+        ));
+    }
+
     let Ok(tools) = Tools::find() else {
         return checks;
     };
@@ -188,7 +214,7 @@ pub fn run() -> Vec<Check> {
     ));
 
     let fds = || NetFds {
-        user: init.user.try_clone().ok(),
+        user: init.user.as_ref().and_then(|u| u.try_clone().ok()),
         hub_pid: init.pid.as_raw(),
         nets: [(Target::Hub, init.net.try_clone().expect("dup netns fd"))].into(),
     };
@@ -250,7 +276,7 @@ pub fn run() -> Vec<Check> {
     }
 
     let spec = EnterSpec {
-        user: Some(init.user.as_raw_fd()),
+        user: init.user.as_ref().map(AsRawFd::as_raw_fd),
         pid: Some(init.pid_ns.as_raw_fd()),
         setup: Some(NodeSetup {
             hostname: "tpo-doctor".to_owned(),
@@ -270,6 +296,25 @@ pub fn run() -> Vec<Check> {
     checks.push(Check::new("mount, UTS namespaces and /proc", true, result));
     let _ = nix::sys::signal::kill(init.pid, nix::sys::signal::Signal::SIGKILL);
     checks
+}
+
+/// Forward-hook chains that drop by default would override a `--kernel-nat` lab's accepts.
+fn kernel_nat_forwarding() -> Result<String, String> {
+    let nft = tool("nft").ok_or("`nft` not found")?;
+    let out = std::process::Command::new(nft)
+        .args(["list", "ruleset"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let drops = forward_drops(&String::from_utf8_lossy(&out.stdout));
+    if drops.is_empty() {
+        return Ok("no forward chain drops by default".to_owned());
+    }
+    Err(format!(
+        "forwarded traffic is dropped by default in: {}\n    fix: let the lab's uplink through, e.g. \
+         `sudo nft insert rule <family> <table> <chain> iifname \"tpo*up\" accept` and the same with \
+         `oifname`, or for Docker `sudo iptables -I DOCKER-USER -i tpo+ -j ACCEPT`",
+        drops.join(", ")
+    ))
 }
 
 fn yes(b: bool) -> &'static str {
@@ -337,6 +382,15 @@ mod tests {
             container_hint("0::/user.slice/user-1000.slice\n", false),
             None
         );
+    }
+
+    #[test]
+    fn finds_forward_chains_that_drop_by_default() {
+        let ruleset = "table ip filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n}\n\
+                       table inet tpo_beef {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n}\n\
+                       table inet fw {\n\tchain fwd {\n\t\ttype filter hook forward priority 0; policy drop;\n\t}\n}\n";
+        assert_eq!(forward_drops(ruleset), ["ip filter FORWARD", "inet fw fwd"]);
+        assert!(forward_drops("table inet x {\n chain c {\n type filter hook input priority 0; policy drop;\n }\n}\n").is_empty());
     }
 
     #[test]

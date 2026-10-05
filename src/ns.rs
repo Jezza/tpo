@@ -20,7 +20,8 @@ pub fn open_ns(pid: i32, kind: &str) -> io::Result<OwnedFd> {
 /// The lab init: pid 1 of the lab's pid namespace, in the lab's user and network namespaces.
 pub struct LabInit {
     pub pid: Pid,
-    pub user: OwnedFd,
+    /// `None` in root mode, where the lab shares the host's user namespace.
+    pub user: Option<OwnedFd>,
     pub net: OwnedFd,
     pub pid_ns: OwnedFd,
     /// Closing this makes the init exit.
@@ -71,7 +72,11 @@ pub fn spawn_init(exe: &Path, rootless: bool) -> io::Result<LabInit> {
     let raw = pid.as_raw();
     let init = LabInit {
         pid,
-        user: open_ns(raw, "user")?,
+        user: if rootless {
+            Some(open_ns(raw, "user")?)
+        } else {
+            None
+        },
         net: open_ns(raw, "net")?,
         pid_ns: open_ns(raw, "pid_for_children").or_else(|_| open_ns(raw, "pid"))?,
         _alive: write,

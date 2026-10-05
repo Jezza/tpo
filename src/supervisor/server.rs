@@ -49,14 +49,19 @@ fn handle(shared: &Shared, stream: UnixStream) {
             let lab = shared.lock().unwrap();
             match lab.node_ns(&node) {
                 Ok(ns) if lab.topo.nodes.contains_key(&node) => {
-                    let fds = [
-                        lab.init.user.as_raw_fd(),
-                        ns.mnt.as_raw_fd(),
-                        ns.net.as_raw_fd(),
-                        ns.uts.as_raw_fd(),
-                        lab.init.pid_ns.as_raw_fd(),
-                    ];
-                    let data = serde_json::json!({ "env": lab.endpoint_env(&node) });
+                    // The user namespace is absent in root mode, so name what we send.
+                    let user = lab.init.user.as_ref().map(AsRawFd::as_raw_fd);
+                    let (names, fds): (Vec<&str>, Vec<RawFd>) = [
+                        ("user", user),
+                        ("mnt", Some(ns.mnt.as_raw_fd())),
+                        ("net", Some(ns.net.as_raw_fd())),
+                        ("uts", Some(ns.uts.as_raw_fd())),
+                        ("pid", Some(lab.init.pid_ns.as_raw_fd())),
+                    ]
+                    .into_iter()
+                    .filter_map(|(name, fd)| fd.map(|fd| (name, fd)))
+                    .unzip();
+                    let data = serde_json::json!({ "env": lab.endpoint_env(&node), "fds": names });
                     reply(&stream, &Response::ok(vec![], data), &fds);
                 }
                 _ => reply(

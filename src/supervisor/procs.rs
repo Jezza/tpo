@@ -83,7 +83,7 @@ fn spawn(lab: &Lab, node: &str, cmd: &str) -> Result<(std::process::Child, i32),
         .map_err(|e| format!("can't open {node}'s log: {e}"))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
     let spec = EnterSpec {
-        user: Some(lab.init.user.as_raw_fd()),
+        user: lab.init.user.as_ref().map(AsRawFd::as_raw_fd),
         mnt: Some(ns.mnt.as_raw_fd()),
         net: Some(ns.net.as_raw_fd()),
         uts: Some(ns.uts.as_raw_fd()),

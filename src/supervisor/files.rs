@@ -46,15 +46,10 @@ fn write_in_place(path: &Path, contents: &str) -> io::Result<()> {
     f.write_all(contents.as_bytes())
 }
 
-pub fn write_etc(dir: &LabDir, topo: &Topology, addrs: &Addresses) -> io::Result<()> {
+pub fn write_etc(dir: &LabDir, topo: &Topology, addrs: &Addresses, resolv: &str) -> io::Result<()> {
     let etc = dir.etc();
     write_in_place(&etc.join("hosts"), &hosts(topo, addrs))?;
-    let resolv = if topo.uses_internet() {
-        super::uplink::resolv_conf()
-    } else {
-        String::new()
-    };
-    write_in_place(&etc.join("resolv.conf"), &resolv)?;
+    write_in_place(&etc.join("resolv.conf"), resolv)?;
     let host = std::fs::read_to_string("/etc/nsswitch.conf").unwrap_or_default();
     write_in_place(&etc.join("nsswitch.conf"), &nsswitch(&host))
 }

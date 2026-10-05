@@ -80,12 +80,17 @@ pub fn run(fds: &NetFds, tools: &Tools, ops: &[Op]) -> Result<(), String> {
 
 fn run_batch(fds: &NetFds, tools: &Tools, batch: &[Op]) -> Result<(), String> {
     let target = &batch[0].target;
-    let net = fds
-        .nets
-        .get(target)
-        .ok_or_else(|| format!("no namespace for `{target}`"))?
-        .as_raw_fd();
-    let user = fds.user.as_ref().map(AsRawFd::as_raw_fd);
+    // The host target runs in our own namespaces.
+    let net = match target {
+        Target::Host => None,
+        t => Some(
+            fds.nets
+                .get(t)
+                .ok_or_else(|| format!("no namespace for `{t}`"))?
+                .as_raw_fd(),
+        ),
+    };
+    let user = net.and(fds.user.as_ref().map(AsRawFd::as_raw_fd));
     let hub_pid = fds.hub_pid.to_string();
     // `@netns:<target>` becomes an inherited fd for that target's netns.
     let mut inherited: Vec<RawFd> = Vec::new();
@@ -171,7 +176,9 @@ fn run_batch(fds: &NetFds, tools: &Tools, batch: &[Op]) -> Result<(), String> {
             if let Some(u) = user {
                 joins.push((u, CloneFlags::CLONE_NEWUSER));
             }
-            joins.push((net, CloneFlags::CLONE_NEWNET));
+            if let Some(net) = net {
+                joins.push((net, CloneFlags::CLONE_NEWNET));
+            }
             ns::join(&joins)?;
             inherited.iter().try_for_each(|fd| ns::inherit(*fd))
         });

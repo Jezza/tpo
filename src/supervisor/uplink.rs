@@ -51,6 +51,11 @@ fn elements(allowed: &Allowed) -> (String, String) {
 /// The gateway's nft ruleset. Membership in `allowed4`/`allowed6` is checked before anything
 /// else, so removing a node also stops its open connections.
 pub fn ruleset(allowed: &Allowed) -> String {
+    gateway_ruleset(allowed, UPLINK, true)
+}
+
+/// The gateway's ruleset for an uplink interface; with `--kernel-nat` the host does the NAT.
+pub fn gateway_ruleset(allowed: &Allowed, uplink: &str, masquerade: bool) -> String {
     let (v4, v6) = elements(allowed);
     let set = |name: &str, ty: &str, elems: &str| {
         if elems.is_empty() {
@@ -61,13 +66,20 @@ pub fn ruleset(allowed: &Allowed) -> String {
     };
     format!(
         "table inet tpo {{\n{}{}  chain forward {{\n    type filter hook forward priority 0; policy drop;\n    \
-         oifname \"{UPLINK}\" ip saddr @allowed4 accept\n    oifname \"{UPLINK}\" ip6 saddr @allowed6 accept\n    \
-         iifname \"{UPLINK}\" ip daddr @allowed4 accept\n    iifname \"{UPLINK}\" ip6 daddr @allowed6 accept\n  }}\n  \
-         chain input {{\n    type filter hook input priority 0; policy drop;\n    iifname \"{UPLINK}\" accept\n    \
+         oifname \"{uplink}\" ip saddr @allowed4 accept\n    oifname \"{uplink}\" ip6 saddr @allowed6 accept\n    \
+         iifname \"{uplink}\" ip daddr @allowed4 accept\n    iifname \"{uplink}\" ip6 daddr @allowed6 accept\n  }}\n  \
+         chain input {{\n    type filter hook input priority 0; policy drop;\n    iifname \"{uplink}\" accept\n    \
          iifname \"lo\" accept\n    ip saddr @allowed4 accept\n    ip6 saddr @allowed6 accept\n  }}\n  \
-         chain postrouting {{\n    type nat hook postrouting priority 100;\n    oifname \"{UPLINK}\" masquerade\n  }}\n}}\n",
+         {}}}\n",
         set("allowed4", "ipv4_addr", &v4),
         set("allowed6", "ipv6_addr", &v6),
+        if masquerade {
+            format!(
+                "chain postrouting {{\n    type nat hook postrouting priority 100;\n    oifname \"{uplink}\" masquerade\n  }}\n"
+            )
+        } else {
+            String::new()
+        },
     )
 }
 
@@ -100,10 +112,12 @@ pub fn start_pasta(lab: &Lab, gateway_holder: i32) -> Result<i32, String> {
         .ok_or("internet access needs `pasta` (install the `passt` package)")?;
     let pidfile = lab.dir.path.join("pasta.pid");
     let mut cmd = Command::new(pasta);
-    cmd.args(["--config-net", "--quiet", "-I", UPLINK])
-        .arg("--userns")
-        .arg(format!("/proc/{}/ns/user", lab.init.pid))
-        .arg("--netns")
+    cmd.args(["--config-net", "--quiet", "-I", UPLINK]);
+    if lab.init.user.is_some() {
+        cmd.arg("--userns")
+            .arg(format!("/proc/{}/ns/user", lab.init.pid));
+    }
+    cmd.arg("--netns")
         .arg(format!("/proc/{gateway_holder}/ns/net"))
         .args(["--dns-forward", DNS4, "--dns-forward", DNS6])
         .arg("--map-host-loopback")
@@ -156,6 +170,16 @@ mod tests {
             empty.contains("set allowed4 { type ipv4_addr; }"),
             "{empty}"
         );
+    }
+
+    #[test]
+    fn kernel_nat_gateways_filter_but_do_not_masquerade() {
+        let r = gateway_ruleset(&allowed(1), "up0", false);
+        assert!(
+            r.contains("oifname \"up0\" ip saddr @allowed4 accept"),
+            "{r}"
+        );
+        assert!(!r.contains("masquerade"), "{r}");
     }
 
     #[test]

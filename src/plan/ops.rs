@@ -11,6 +11,8 @@ pub enum Target {
     /// The internet gateway's netns.
     Gateway,
     Node(String),
+    /// The host's own namespaces (root mode only).
+    Host,
 }
 
 impl Target {
@@ -25,6 +27,7 @@ impl Target {
         match s {
             "hub" => Target::Hub,
             "gateway" => Target::Gateway,
+            "host" => Target::Host,
             n => Target::node(n),
         }
     }
@@ -39,6 +42,7 @@ impl fmt::Display for Target {
             Target::Hub => f.write_str("hub"),
             Target::Gateway => f.write_str("gateway"),
             Target::Node(n) => f.write_str(n),
+            Target::Host => f.write_str("host"),
         }
     }
 }
