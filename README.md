@@ -144,6 +144,8 @@ host_loopback = true      # this machine's 127.0.0.1 is reachable from nodes as 
 | `tpo logs <node> [-f]` | a node's process output |
 | `tpo explain <node>` | the `ip`/`tc` commands that build a node |
 | `tpo doctor` | check this machine |
+| `sudo tpo up --root [--kernel-nat] <file>` | root mode (see below) |
+| `sudo tpo down --force [--lab <name>]` | clean up after a root lab whose supervisor died |
 
 **Sides and selectors.** Each argument to `cut`, `set` and `heal` is a *side*: a node, a group,
 `*`, or a comma list. The command affects every link between two different sides.
@@ -158,6 +160,20 @@ host_loopback = true      # this machine's 127.0.0.1 is reachable from nodes as 
 
 **Faults are separate from the file.** Faults (cuts and `set`s) sit on top of the topology file
 and survive `apply`. `tpo heal --all` always returns to exactly what the file says.
+
+## Root mode
+
+`sudo tpo up --root lab.toml` runs the lab without a user namespace:
+- Every node also appears in `ip netns` as `tpo-<lab>-<node>`, so other tools can use it, e.g.
+  `ip netns exec tpo-lab-a tcpdump -i eth0`.
+- Internet access still goes through pasta by default, which changes nothing on the host.
+
+`--kernel-nat` makes the host kernel do the NAT instead, for more throughput and working ping.
+It adds a veth and an nft table on the host and turns on forwarding. Everything it changes is
+undone on `down`, including the previous sysctl values. A forward chain that drops by default
+(Docker, ufw, firewalld) blocks it; `sudo tpo doctor` detects that and shows the fix.
+
+If a root lab's supervisor dies, its namespaces stay behind. `sudo tpo down --force` removes them.
 
 ## From Rust
 
@@ -187,7 +203,7 @@ See [`docs/specs`](docs/specs) for the full design.
 ## Limitations
 
 - Linux only.
-- Root mode (`--root`), for bridging to physical interfaces, isn't implemented yet.
+- Bridging nodes to physical interfaces isn't supported yet.
 - In direct mode, broadcast and multicast aren't shaped by link properties.
 - In routed mode, multicast doesn't cross hops.
 - Rootless ICMP (ping) to the internet needs `net.ipv4.ping_group_range` to allow it. TCP and

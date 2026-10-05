@@ -112,13 +112,27 @@ pub fn start_pasta(lab: &Lab, gateway_holder: i32) -> Result<i32, String> {
         .ok_or("internet access needs `pasta` (install the `passt` package)")?;
     let pidfile = lab.dir.path.join("pasta.pid");
     let mut cmd = Command::new(pasta);
-    cmd.args(["--config-net", "--quiet", "-I", UPLINK]);
+    cmd.args(["--config-net", "-I", UPLINK]);
     if lab.init.user.is_some() {
         cmd.arg("--userns")
             .arg(format!("/proc/{}/ns/user", lab.init.pid));
+    } else {
+        // Root mode: switching to `nobody` would lose the capability to enter a netns owned by
+        // the host's user namespace (verified), so pasta stays uid 0 inside its own sandbox.
+        cmd.args(["--runas", "0"]);
     }
+    // As root, pasta drops privileges before opening the netns and can no longer open another
+    // process's /proc/<pid>/ns/net; root labs have the gateway's netns in /run/netns instead.
+    let netns = match lab
+        .nodes
+        .get(&Target::Gateway)
+        .and_then(|g| g.netns_name.as_deref())
+    {
+        Some(name) => format!("/run/netns/{name}"),
+        None => format!("/proc/{gateway_holder}/ns/net"),
+    };
     cmd.arg("--netns")
-        .arg(format!("/proc/{gateway_holder}/ns/net"))
+        .arg(netns)
         .args(["--dns-forward", DNS4, "--dns-forward", DNS6])
         .arg("--map-host-loopback")
         .arg(if lab.topo.internet.host_loopback {

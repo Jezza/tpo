@@ -377,7 +377,11 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - pasta and `/dev/net/tun` are runtime dependencies only for rootless labs using `internet`.
 - **Root mode uses pasta too, by default** (decided 2026-10-05). pasta runs fine as root and
   needs no host-side changes, so a crashed root lab leaves no sysctls, routes or firewall rules
-  behind. The only differences from rootless: no `--userns`, and the lab dir is `/run/tpo/<lab>/`.
+  behind. The differences from rootless: no `--userns`; the lab dir is `/run/tpo/<lab>/`; pasta
+  gets the gateway's `/run/netns/tpo-<lab>-gateway` path (as root it drops privileges before
+  opening the netns and can't open another process's `/proc/<pid>/ns/net`); and pasta runs with
+  `--runas 0` (switching to `nobody` loses the capability to enter a netns owned by the host's
+  user namespace; verified on pasta from Debian 13, 2026-10-05).
 - **`--kernel-nat` (root only, opt-in)** uses the kernel instead of pasta, for throughput and
   ICMP:
   - The gateway gets a veth pair into the host netns (`tpo<hash>up` on the host, `up0` in the

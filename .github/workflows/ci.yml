@@ -29,3 +29,7 @@ jobs:
       - run: sudo modprobe -a sch_netem sch_htb sch_ingress cls_flower cls_matchall act_gact || true
       - run: cargo run -- doctor
       - run: cargo test --tests
+      # Root mode (runners have passwordless sudo). One at a time: two tests compare host sysctls.
+      - run: |
+          bin=$(cargo test --test root --no-run --message-format=json | jq -r 'select(.profile.test == true and .target.name == "root") | .executable')
+          sudo "$bin" --test-threads=1

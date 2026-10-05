@@ -142,9 +142,27 @@ pub fn load(dir: &LabDir) -> Option<HostState> {
     serde_json::from_value(v.get("host")?.clone()).ok()
 }
 
+/// The pasta recorded in `state.json`, if that pid is still a pasta process.
+fn recorded_pasta(dir: &LabDir) -> Option<i32> {
+    let text = std::fs::read_to_string(dir.state()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = i32::try_from(v["pasta_pid"].as_i64()?).ok()?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    String::from_utf8_lossy(&cmdline)
+        .contains("pasta")
+        .then_some(pid)
+}
+
 /// Undoes everything a root-mode lab changed on the host, for a lab whose supervisor is gone.
 pub fn force_down(dir: &LabDir) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
+    if let Some(pid) = recorded_pasta(dir) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        done.push(format!("stopped pasta (pid {pid})"));
+    }
     if let Some(state) = load(dir) {
         for name in &state.netns {
             delete_netns(name);
