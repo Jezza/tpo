@@ -375,30 +375,30 @@ namespaces (§7.1). In the mount namespace (made `MS_REC|MS_PRIVATE` first):
 - Rootless ICMP to the internet requires the host's `net.ipv4.ping_group_range` to allow it;
   TCP/UDP always work.
 - pasta and `/dev/net/tun` are runtime dependencies only for rootless labs using `internet`.
-- **Root mode does not use pasta** (kernel NAT; *open question below*):
-  - The gateway gets a veth pair into the host netns (`tpo-<lab>-up`), unnumbered on the host
-    side: the host gets `ip route add <subnet> via <gateway .254> dev tpo-<lab>-up onlink` (and
-    the IPv6 equivalent via the gateway's `fe80::<idx>`), plus a static neighbour for the gateway.
-  - The host does NAT in an `nft` table `tpo-<lab>`:
-    `ip saddr <subnet> oifname != "tpo-<lab>-up" masquerade` (and `ip6 saddr <subnet6>`), so it
-    keeps working when the host's uplink changes (Wi-Fi, VPN).
-  - DNS: `192.0.2.53` is DNATed to the host's resolver; a loopback resolver (`127.0.0.1`,
-    `127.0.0.53`) requires `route_localnet=1` on `tpo-<lab>-up`. IPv6 has no `route_localnet`, so
-    the IPv6 DNS address is omitted when the host's resolvers are loopback-only.
-    `host_loopback`: DNAT `192.0.2.2 → 127.0.0.1` (same `route_localnet`), so 127.0.0.1-bound
-    host services are reachable as with pasta; IPv6 `host` maps only to non-loopback listeners.
-  - Forwarding: `net.ipv4.ip_forward=1`; for IPv6, `accept_ra=2` is set on the host's
-    RA-configured interfaces *before* enabling forwarding so the host keeps its SLAAC default
-    route. Previous sysctl values are recorded in `state.json` and restored on `down` /
-    `down --force`.
+- **Root mode uses pasta too, by default** (decided 2026-10-05). pasta runs fine as root and
+  needs no host-side changes, so a crashed root lab leaves no sysctls, routes or firewall rules
+  behind. The only differences from rootless: no `--userns`, and the lab dir is `/run/tpo/<lab>/`.
+- **`--kernel-nat` (root only, opt-in)** uses the kernel instead of pasta, for throughput and
+  ICMP:
+  - The gateway gets a veth pair into the host netns (`tpo<hash>up` on the host, `up0` in the
+    gateway), unnumbered on both sides with static neighbours: the gateway's default routes are
+    `via 169.254.0.1 dev up0 onlink` and `via fe80::1 dev up0`; the host routes
+    `<subnet>`/`<subnet6>` back via the gateway (`onlink`, static neighbour).
+  - The host does NAT in an `nft` table `tpo_<hash>`: `ip saddr <subnet> oifname != "tpo<hash>up"
+    masquerade` (and `ip6 saddr <subnet6>`), so it keeps working when the host's uplink changes.
+    The gateway's own ruleset keeps the `allowed` sets on `up0` but does no NAT.
+  - DNS: `192.0.2.53` is DNATed to the host's first IPv4 resolver; a loopback resolver
+    (`127.0.0.1`, `127.0.0.53`) needs `route_localnet=1` on `tpo<hash>up`. IPv6 has no
+    `route_localnet`, so the IPv6 DNS address is DNATed only to a non-loopback IPv6 resolver and
+    omitted from the lab's `resolv.conf` otherwise. `host_loopback`: DNAT `192.0.2.2 → 127.0.0.1`
+    (same `route_localnet`).
+  - Forwarding: `net.ipv4.ip_forward=1`; for IPv6, `accept_ra=2` is set on the host's interfaces
+    that accept RAs *before* `net.ipv6.conf.all.forwarding=1`, so the host keeps its SLAAC
+    default route. Previous values are recorded in `state.json` and restored on `down` /
+    `down --force`, unless another `--kernel-nat` lab is still running.
   - Host firewalls: a `drop` in any forward-hook chain (Docker's `FORWARD DROP`, ufw, firewalld)
-    overrides tpo's accept; `doctor` detects this and prints the exact fix.
-  - `down` (and `down --force`) remove the veth, routes, nft table and restore sysctls.
-- **Open question (raised by review): pasta in root mode too.** pasta runs fine as root and would
-  remove every host-side change above (sysctls, routes, nft, crash leftovers), at the cost of
-  kernel-NAT throughput and ICMP. Alternative: pasta default in root mode, kernel NAT opt-in
-  (`--kernel-nat`). To be decided before the root-mode uplink is implemented (it is the last
-  milestone).
+    overrides tpo's accept; `doctor --kernel-nat` detects this and prints the fix.
+  - `down` (and `down --force`) remove the veth, routes and nft table and restore the sysctls.
 - **Decision — run pasta as a binary, don't link a library.** This is how rootless Podman
   (`containers/common`) and rootlesskit use pasta/slirp4netns. passt has no library API and is
   GPL-2.0-or-later. The linkable alternatives were rejected: libslirp (slower, weak IPv6),
@@ -630,6 +630,4 @@ Where the v1 implementation departs from or pins down the design above:
 - **`host_loopback`** maps IPv4 only (`192.0.2.2`, resolvable as `host`).
 - **Supervisor log** is `$XDG_RUNTIME_DIR/tpo/<lab>.log`, outside the lab dir, so it survives
   teardown. `up` refuses runtime dirs whose control-socket path exceeds `sun_path`.
-- **Not implemented yet:** root mode (`--root`, `down --force`) — pending the open question in
-  §6 about using pasta there too.
 
