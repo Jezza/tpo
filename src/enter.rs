@@ -46,6 +46,13 @@ pub struct EnterSpec {
     pub cmd: Vec<String>,
 }
 
+/// Writes one line of the report pipe with a single `write` call. The wrapper and the child
+/// write to the same pipe concurrently, and only single writes (up to `PIPE_BUF`) are atomic;
+/// `writeln!` on an unbuffered file issues one write per formatted piece and can interleave.
+fn report_line(w: &mut impl Write, line: &str) {
+    let _ = w.write_all(format!("{line}\n").as_bytes());
+}
+
 static CHILD: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn forward(sig: i32) {
@@ -95,7 +102,7 @@ pub fn enter(spec: &EnterSpec) -> ! {
         Ok(ForkResult::Parent { child }) => {
             CHILD.store(child.as_raw(), Ordering::SeqCst);
             if let Some(r) = report.as_mut() {
-                let _ = writeln!(r, "pid {child}");
+                report_line(r, &format!("pid {child}"));
             }
             drop(report);
             let handler = SigAction::new(
@@ -138,7 +145,7 @@ fn child(spec: &EnterSpec, report: Option<&mut File>) -> ! {
         let _ = nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0));
     }
     if let Some(r) = report {
-        let _ = writeln!(r, "ready");
+        report_line(r, "ready");
     }
     if spec.hold {
         let mut sink = Vec::new();
@@ -256,5 +263,34 @@ pub fn spawn(
                 why.to_owned()
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records each `write` call separately.
+    #[derive(Default)]
+    struct Calls(Vec<Vec<u8>>);
+
+    impl Write for Calls {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn report_lines_are_single_writes_so_writers_cannot_interleave() {
+        // The wrapper ("pid …") and the child ("ready") share the report pipe. Pipe writes up to
+        // PIPE_BUF are atomic, but only if each line is one write call.
+        let mut w = Calls::default();
+        report_line(&mut w, &format!("pid {}", 143296));
+        report_line(&mut w, "ready");
+        assert_eq!(w.0, [b"pid 143296\n".to_vec(), b"ready\n".to_vec()]);
     }
 }
