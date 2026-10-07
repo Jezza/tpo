@@ -1,12 +1,14 @@
 //! `ctl.sock`, signals and fault timers.
 
 use super::{Shared, now_ms};
+use crate::labdir::LabDir;
 use crate::proto::{Envelope, Request, Response};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use std::io::{BufRead, BufReader, IoSlice, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub fn serve(shared: Shared) -> ! {
     let path = shared.lock().unwrap().dir.ctl();
@@ -97,7 +99,13 @@ fn shutdown(shared: &Shared, code: i32) -> ! {
     std::process::exit(code)
 }
 
-pub fn spawn_signal_thread(shared: Shared) {
+/// Where the signal thread finds the lab once it exists.
+pub type LabSlot = Arc<Mutex<Option<Shared>>>;
+
+/// Handles Ctrl-C/SIGTERM/SIGHUP from the moment the lab init exists. Once the lab is up this is
+/// a normal teardown. While it's still starting (or wedged holding the lock) the init is killed
+/// directly: its pid namespace, and every lab process with it, dies with it.
+pub fn spawn_signal_thread(slot: LabSlot, init: nix::unistd::Pid, dir: LabDir, root: bool) {
     use nix::sys::signal::{SigSet, Signal};
     std::thread::spawn(move || {
         let mut set = SigSet::empty();
@@ -105,7 +113,29 @@ pub fn spawn_signal_thread(shared: Shared) {
             set.add(s);
         }
         let _ = set.wait();
-        shutdown(&shared, 0);
+        let shared = slot.lock().unwrap().clone();
+        if let Some(shared) = shared {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if let Ok(mut lab) = shared.try_lock() {
+                    let started = !lab.starting;
+                    lab.teardown();
+                    std::process::exit(if started { 0 } else { 130 });
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let _ = nix::sys::signal::kill(init, Signal::SIGKILL);
+        if root {
+            eprintln!(
+                "tpo: interrupted while starting; clean up with `sudo tpo down --force --lab {}`",
+                dir.name
+            );
+        } else {
+            let _ = dir.remove();
+            eprintln!("tpo: interrupted while starting");
+        }
+        std::process::exit(130);
     });
 }
 

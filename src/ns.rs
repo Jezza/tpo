@@ -31,7 +31,7 @@ pub struct LabInit {
 /// Clones the lab init. Must be called while the process is single-threaded, from the thread
 /// that will outlive the lab (the init's `PR_SET_PDEATHSIG` fires when that thread exits).
 pub fn spawn_init(exe: &Path, rootless: bool) -> io::Result<LabInit> {
-    let (read, write) = nix::unistd::pipe().map_err(io_err)?;
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(io_err)?;
     // The init inherits `read` across exec; `write` stays with us.
     fcntl(&write, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(io_err)?;
     let read_fd = read.as_raw_fd();

@@ -149,3 +149,107 @@ fn killing_the_supervisor_kills_the_lab() {
     lab.tpo(&["down"]);
     assert!(!lab.lab_dir().exists());
 }
+
+#[test]
+fn node_processes_inherit_no_stray_fds() {
+    if !userns_available() {
+        return;
+    }
+    let lab = Lab::new(
+        "fds",
+        &format!(
+            "{CHAIN}\n[run]\n\"a\" = \"ls /proc/self/fd | tr '\\\\n' ' '; echo; sleep 600\"\n"
+        ),
+    );
+    lab.up();
+    let log = lab.lab_dir().join("logs").join("a.log");
+    assert!(wait_until(Duration::from_secs(5), || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains('\n'))
+    }));
+    // ls itself opens fd 3 for the directory; nothing else may be open.
+    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "0 1 2 3");
+}
+
+/// Starts `tpo up` in the foreground with every node's setup slowed down.
+fn slow_foreground_up(lab: &Lab, slow_ms: u64) -> std::process::Child {
+    std::fs::create_dir_all(lab.runtime_dir()).unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_tpo"))
+        .args(["up", lab.file().to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", lab.runtime_dir())
+        .env("TPO_TEST_SLOW_START", slow_ms.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Processes that belong to this lab (their command lines mention its runtime dir).
+fn lab_processes(lab: &Lab) -> Vec<i32> {
+    let marker = lab.runtime_dir().to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&marker))
+        })
+        .collect()
+}
+
+#[test]
+fn ctrl_c_during_startup_stops_the_lab() {
+    if !userns_available() {
+        return;
+    }
+    let lab = Lab::new("interrupt", CHAIN);
+    let mut up = slow_foreground_up(&lab, 30_000);
+    assert!(
+        wait_until(Duration::from_secs(5), || !lab_processes(&lab).is_empty()),
+        "startup began"
+    );
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(up.id() as i32),
+        nix::sys::signal::SIGINT,
+    )
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || up.try_wait().unwrap().is_some()),
+        "Ctrl-C stops a lab that is still starting"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || lab_processes(&lab).is_empty()),
+        "{:?}",
+        lab_processes(&lab)
+    );
+}
+
+#[test]
+fn a_node_that_never_starts_times_out() {
+    if !userns_available() {
+        return;
+    }
+    let lab = Lab::new("stuck", CHAIN);
+    std::fs::create_dir_all(lab.runtime_dir()).unwrap();
+    let start = std::time::Instant::now();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_tpo"))
+        .args(["up", "-d", lab.file().to_str().unwrap()])
+        .env("XDG_RUNTIME_DIR", lab.runtime_dir())
+        .env("TPO_TEST_SLOW_START", "60000")
+        .env("TPO_START_TIMEOUT", "1s")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        start.elapsed()
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("didn't start within 1s"), "{err}");
+    assert!(
+        wait_until(Duration::from_secs(5), || lab_processes(&lab).is_empty()),
+        "{:?}",
+        lab_processes(&lab)
+    );
+}

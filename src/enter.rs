@@ -141,6 +141,14 @@ fn child(spec: &EnterSpec, report: Option<&mut File>) -> ! {
     {
         fail(format!("can't set up node `{}`: {e}", setup.hostname));
     }
+    if spec.setup.is_some()
+        && let Some(ms) = std::env::var("TPO_TEST_SLOW_START")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    {
+        // Test hook: a node that is slow (or never manages) to start.
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     if spec.setpgid {
         let _ = nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0));
     }
@@ -151,6 +159,23 @@ fn child(spec: &EnterSpec, report: Option<&mut File>) -> ! {
         let mut sink = Vec::new();
         let _ = std::io::stdin().read_to_end(&mut sink);
         std::process::exit(0);
+    }
+    // The namespace and report fds were for us; the command mustn't inherit them.
+    for fd in [
+        spec.user,
+        spec.mnt,
+        spec.net,
+        spec.uts,
+        spec.pid,
+        spec.report,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _ = nix::fcntl::fcntl(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        );
     }
     let Some((program, args)) = spec.cmd.split_first() else {
         fail("no command given")
@@ -196,6 +221,63 @@ fn build_node(setup: &NodeSetup) -> nix::Result<()> {
     Ok(())
 }
 
+/// How long a node may take to start: `TPO_START_TIMEOUT` (e.g. `90s`), 30s by default.
+pub fn start_timeout() -> std::time::Duration {
+    std::env::var("TPO_START_TIMEOUT")
+        .ok()
+        .and_then(|v| crate::units::parse_duration(&v).ok())
+        .unwrap_or(std::time::Duration::from_secs(30))
+}
+
+#[derive(Debug, PartialEq)]
+enum Report {
+    Ready,
+    /// The writers closed the pipe without `ready`.
+    Closed,
+    TimedOut,
+}
+
+/// Reads `pid <n>` and `ready` lines from the report pipe until both arrived, the pipe closes, or
+/// `timeout` passes.
+fn read_report(pipe: File, timeout: std::time::Duration) -> (Option<i32>, Report) {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::os::fd::AsFd;
+    let deadline = std::time::Instant::now() + timeout;
+    let (mut pid, mut ready) = (None, false);
+    let mut buf = Vec::new();
+    let mut pipe = pipe;
+    loop {
+        while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+            if let Some(p) = line.strip_prefix("pid ") {
+                pid = p.trim().parse().ok();
+            } else if line == "ready" {
+                ready = true;
+            }
+        }
+        if pid.is_some() && ready {
+            return (pid, Report::Ready);
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return (pid, Report::TimedOut);
+        }
+        let ms = u16::try_from(left.as_millis().max(1)).unwrap_or(u16::MAX);
+        let mut fds = [PollFd::new(pipe.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(ms)) {
+            Ok(0) | Err(nix::Error::EINTR) => continue,
+            Err(_) => return (pid, Report::Closed),
+            Ok(_) => {}
+        }
+        let mut chunk = [0u8; 512];
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => return (pid, Report::Closed),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
 /// Spawns `exe __enter` with `spec`'s namespace fds inherited; returns the wrapper and the host
 /// pid of the process inside, once it reported `ready`.
 pub fn spawn(
@@ -205,9 +287,10 @@ pub fn spawn(
     stdout: std::process::Stdio,
     stderr: std::process::Stdio,
 ) -> Result<(std::process::Child, i32), String> {
-    use std::io::BufRead;
     use std::os::fd::AsRawFd;
-    let (read, write) = nix::unistd::pipe().map_err(|e| e.to_string())?;
+    // Close-on-exec: only the write end is handed to `__enter`, explicitly, in pre_exec.
+    let (read, write) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(|e| e.to_string())?;
     spec.report = Some(write.as_raw_fd());
     let inherit: Vec<RawFd> = [
         spec.user,
@@ -236,20 +319,18 @@ pub fn spawn(
         .map_err(|e| format!("can't start `tpo __enter`: {e}"))?;
     drop(write);
 
-    let (mut pid, mut ready) = (None, false);
-    for line in std::io::BufReader::new(File::from(read)).lines() {
-        let Ok(line) = line else { break };
-        if let Some(p) = line.strip_prefix("pid ") {
-            pid = p.trim().parse().ok();
-        } else if line == "ready" {
-            ready = true;
-        }
-        if pid.is_some() && ready {
-            break;
-        }
-    }
+    let timeout = start_timeout();
+    let (pid, ready) = read_report(File::from(read), timeout);
     match (pid, ready) {
-        (Some(pid), true) => Ok((child, pid)),
+        (Some(pid), Report::Ready) => Ok((child, pid)),
+        (_, Report::TimedOut) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!(
+                "didn't start within {}",
+                crate::units::human_duration(timeout)
+            ))
+        }
         _ => {
             let mut why = String::new();
             if let Some(mut err) = child.stderr.take() {

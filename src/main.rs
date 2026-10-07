@@ -293,7 +293,8 @@ fn up_detached(file: &PathBuf, root: bool, kernel_nat: bool) -> Result<ExitCode,
     if LabDir::new(&topo.name).live_pid().is_some() {
         return Err(format!("lab `{}` is already running", topo.name));
     }
-    let (read, write) = nix::unistd::pipe().map_err(|e| e.to_string())?;
+    let (read, write) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).map_err(|e| e.to_string())?;
     let write_fd = write.as_raw_fd();
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(exe);

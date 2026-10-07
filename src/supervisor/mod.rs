@@ -80,6 +80,8 @@ pub struct Lab {
     pub host: host::HostState,
     /// Use `--kernel-nat` when the lab uses `internet`.
     pub kernel_nat: bool,
+    /// Until the lab is up (a signal then means "interrupted", exit 130).
+    pub starting: bool,
 }
 
 pub type Shared = Arc<Mutex<Lab>>;
@@ -183,6 +185,8 @@ fn start(opts: &Options) -> Result<Shared, String> {
     let init = ns::spawn_init(&exe, !opts.root)
         .map_err(|e| format!("can't create the lab namespaces: {e}"))?;
     block_shutdown_signals();
+    let slot = server::LabSlot::default();
+    server::spawn_signal_thread(slot.clone(), init.pid, dir.clone(), opts.root);
 
     let topo_mode = topo.mode;
     let lab = Lab {
@@ -207,10 +211,12 @@ fn start(opts: &Options) -> Result<Shared, String> {
             ..Default::default()
         },
         kernel_nat: opts.kernel_nat,
+        starting: true,
     };
     files::write_etc(&lab.dir, &lab.topo, &lab.addrs, &lab.resolv_conf())
         .map_err(|e| format!("can't write the lab's /etc files: {e}"))?;
     let shared = Arc::new(Mutex::new(lab));
+    *slot.lock().unwrap() = Some(shared.clone());
     {
         let mut lab = shared.lock().unwrap();
         let result = build(&mut lab);
@@ -226,7 +232,7 @@ fn start(opts: &Options) -> Result<Shared, String> {
         format!("{}\n", std::process::id()),
     )
     .map_err(|e| e.to_string())?;
-    server::spawn_signal_thread(shared.clone());
+    shared.lock().unwrap().starting = false;
     server::spawn_timer_thread(shared.clone());
     Ok(shared)
 }
@@ -303,8 +309,9 @@ pub(super) fn spawn_holder(lab: &Lab, hostname: &str, keep: bool) -> Result<Node
         hold: true,
         ..EnterSpec::default()
     };
-    let (mut child, host_pid) =
-        lab.spawn_enter(spec, Stdio::piped(), Stdio::null(), Stdio::inherit())?;
+    let (mut child, host_pid) = lab
+        .spawn_enter(spec, Stdio::piped(), Stdio::null(), Stdio::inherit())
+        .map_err(|e| format!("node `{hostname}` {e}"))?;
     let open = |kind| {
         ns::open_ns(host_pid, kind)
             .map_err(|e| format!("can't open `{hostname}`'s {kind} namespace: {e}"))
